@@ -2,10 +2,12 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { kernelApi } from "../api/kernel";
 
 function fmt(ts: string) { return new Date(ts).toLocaleString(); }
-
-const RISK_BADGE: Record<string, string> = {
-  low: "badge-ok", medium: "badge-warn", high: "badge-danger",
-};
+function timeLeft(expires: string) {
+  const ms = new Date(expires).getTime() - Date.now();
+  if (ms < 0) {return "expired";}
+  if (ms < 60_000) {return `${Math.floor(ms / 1000)}s left`;}
+  return `${Math.floor(ms / 60_000)}m left`;
+}
 
 export function Approvals() {
   const qc = useQueryClient();
@@ -18,11 +20,11 @@ export function Approvals() {
 
   const approveMut = useMutation({
     mutationFn: kernelApi.approve,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["approvals"] }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["approvals"] }),
   });
   const rejectMut = useMutation({
     mutationFn: kernelApi.reject,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["approvals"] }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["approvals"] }),
   });
 
   const approvals = data?.approvals ?? [];
@@ -54,47 +56,42 @@ export function Approvals() {
             <div key={a.approval_id} className="card">
               <div className="row" style={{ marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
                 <span style={{ fontWeight: 700, fontSize: 15, color: "var(--text-strong)" }}>
-                  {a.action_type}
+                  Action Request
                 </span>
-                <span className={`badge ${RISK_BADGE[a.risk_level] ?? "badge-neutral"}`}>
-                  {a.risk_level} risk
-                </span>
-                {!a.reversible && (
-                  <span className="badge badge-danger">irreversible</span>
-                )}
+                <span className="badge badge-warn">pending</span>
                 <span style={{ flex: 1 }} />
-                <span className="muted" style={{ fontSize: 12 }}>{fmt(a.created_at)}</span>
+                <span className="badge badge-neutral" style={{ fontFamily: "var(--mono)", fontSize: 11 }}>
+                  {timeLeft(a.expires_at)}
+                </span>
               </div>
 
-              {a.description && (
-                <div style={{ fontSize: 13, color: "var(--text)", marginBottom: 10, lineHeight: 1.5 }}>
-                  {a.description}
+              <div className="stack" style={{ gap: 6, marginBottom: 14, fontSize: 13 }}>
+                <div className="row" style={{ gap: 8 }}>
+                  <span className="muted" style={{ width: 120, flexShrink: 0 }}>Request ID</span>
+                  <span className="mono" style={{ fontSize: 11, color: "var(--text)" }}>{a.action_request_id}</span>
                 </div>
-              )}
-
-              {a.payload && Object.keys(a.payload).length > 0 && (
-                <pre style={{
-                  background: "var(--bg)", border: "1px solid var(--border)",
-                  borderRadius: "var(--r-md)", padding: "10px 12px",
-                  fontSize: 12, fontFamily: "var(--mono)", marginBottom: 14,
-                  overflowX: "auto", maxHeight: 120, overflowY: "auto"
-                }}>
-                  {JSON.stringify(a.payload, null, 2)}
-                </pre>
-              )}
+                <div className="row" style={{ gap: 8 }}>
+                  <span className="muted" style={{ width: 120, flexShrink: 0 }}>Requested by</span>
+                  <span style={{ color: "var(--text)" }}>{a.requested_by}</span>
+                </div>
+                <div className="row" style={{ gap: 8 }}>
+                  <span className="muted" style={{ width: 120, flexShrink: 0 }}>Expires</span>
+                  <span style={{ color: "var(--text)" }}>{fmt(a.expires_at)}</span>
+                </div>
+              </div>
 
               <div className="row" style={{ gap: 8 }}>
                 <button
                   className="btn btn-primary"
                   onClick={() => approveMut.mutate(a.approval_id)}
-                  disabled={approveMut.isPending}
+                  disabled={approveMut.isPending || rejectMut.isPending}
                 >
                   ✅ Approve
                 </button>
                 <button
                   className="btn btn-danger"
                   onClick={() => rejectMut.mutate(a.approval_id)}
-                  disabled={rejectMut.isPending}
+                  disabled={approveMut.isPending || rejectMut.isPending}
                 >
                   ✕ Reject
                 </button>

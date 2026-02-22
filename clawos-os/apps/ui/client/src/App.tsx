@@ -1,6 +1,33 @@
+import { Component, type ReactNode } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Layout } from "./components/Layout";
+
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: 40, fontFamily: "monospace", color: "#ef4444", background: "#0f1117", minHeight: "100vh" }}>
+          <h2 style={{ color: "#fafafa", marginBottom: 16 }}>ClawOS — Runtime Error</h2>
+          <pre style={{ background: "#1a1d27", padding: 20, borderRadius: 8, fontSize: 13, whiteSpace: "pre-wrap" }}>
+            {(this.state.error as Error).message}
+            {"\n\n"}
+            {(this.state.error as Error).stack}
+          </pre>
+          <button
+            style={{ marginTop: 16, padding: "8px 16px", background: "#5c7be0", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer" }}
+            onClick={() => window.location.reload()}
+          >
+            Reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 import { Overview }   from "./pages/Overview";
 import { Chat }       from "./pages/Chat";
 import { Channels }   from "./pages/Channels";
@@ -29,6 +56,7 @@ const qc = new QueryClient({
 
 export default function App() {
   return (
+    <ErrorBoundary>
     <QueryClientProvider client={qc}>
       <BrowserRouter>
         <Routes>
@@ -56,5 +84,6 @@ export default function App() {
         </Routes>
       </BrowserRouter>
     </QueryClientProvider>
+    </ErrorBoundary>
   );
 }

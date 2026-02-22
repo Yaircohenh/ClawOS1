@@ -1,13 +1,15 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { kernelApi } from "../api/kernel";
 
-const ACTION_META: Record<string, { icon: string; desc: string }> = {
-  web_search:         { icon: "🔍", desc: "Search the web for information" },
-  read_file:          { icon: "📄", desc: "Read a file from the workspace" },
-  summarize_document: { icon: "📝", desc: "Summarize a document or PDF" },
-  write_file:         { icon: "✏️",  desc: "Write or overwrite a file" },
-  run_shell:          { icon: "💻", desc: "Execute a shell command (high risk)" },
-  send_email:         { icon: "📧", desc: "Send an email via SMTP" },
+const ACTION_META: Record<string, { icon: string; desc: string; risk: string; reversible: boolean }> = {
+  web_search:         { icon: "🔍", desc: "Search the web for information",        risk: "low",    reversible: true },
+  read_file:          { icon: "📄", desc: "Read a file from the workspace",         risk: "low",    reversible: true },
+  summarize_document: { icon: "📝", desc: "Summarize a document or PDF",            risk: "low",    reversible: true },
+  write_file:         { icon: "✏️",  desc: "Write or overwrite a file",             risk: "medium", reversible: false },
+  run_shell:          { icon: "💻", desc: "Execute a shell command",                risk: "high",   reversible: false },
+  send_email:         { icon: "📧", desc: "Send an email via SMTP",                 risk: "medium", reversible: false },
+  classify_intent:    { icon: "🧠", desc: "Classify the intent of a message",       risk: "low",    reversible: true },
+  interpret_result:   { icon: "🔎", desc: "Interpret and format an agent result",   risk: "low",    reversible: true },
 };
 
 const MODES = ["auto", "ask", "block"] as const;
@@ -84,10 +86,10 @@ export function Risk() {
                       </div>
                     </td>
                     <td>
-                      <span className={`badge badge-${p.risk_level === "high" ? "danger" : p.risk_level === "medium" ? "warn" : "ok"}`}>
-                        {p.risk_level}
+                      <span className={`badge badge-${meta.risk === "high" ? "danger" : meta.risk === "medium" ? "warn" : "ok"}`}>
+                        {meta.risk}
                       </span>
-                      {!p.reversible && (
+                      {!meta.reversible && (
                         <span className="badge badge-neutral" style={{ marginLeft: 6 }}>permanent</span>
                       )}
                     </td>

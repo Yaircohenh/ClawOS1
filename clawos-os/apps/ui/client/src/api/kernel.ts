@@ -107,14 +107,12 @@ export interface Artifact {
 export interface Approval {
   approval_id: string;
   workspace_id: string;
-  agent_id: string;
   action_request_id: string;
-  action_type: string;
-  payload: Record<string, unknown>;
-  risk_level: string;
-  reversible: boolean;
-  description?: string;
-  created_at: string;
+  requested_by: string;
+  status: "pending" | "approved" | "rejected";
+  expires_at: string;
+  decision_reason: string | null;
+  decided_at: string | null;
 }
 
 export interface Connection {
@@ -127,9 +125,7 @@ export interface Connection {
 export interface RiskPolicy {
   action_type: string;
   mode: "auto" | "ask" | "block";
-  risk_level: string;
-  reversible: boolean;
-  description: string;
+  workspace_id: string;
   updated_at: string;
 }
 
@@ -152,8 +148,11 @@ export const kernelApi = {
   listEvents: (params?: { limit?: number }) =>
     get<{ ok: boolean; events: TaskEvent[] }>("/events", params as Record<string, string | number>),
 
-  // Approvals
-  listApprovals: () => get<{ ok: boolean; approvals: Approval[] }>("/approvals"),
+  // Approvals — only return pending ones for the UI
+  listApprovals: async () => {
+    const data = await get<{ approvals: Approval[] }>("/approvals");
+    return { ok: true, approvals: (data.approvals ?? []).filter((a) => a.status === "pending") };
+  },
   approve: (approvalId: string) => post(`/approvals/${approvalId}/approve`),
   reject: (approvalId: string) => post(`/approvals/${approvalId}/reject`),
 
@@ -161,8 +160,14 @@ export const kernelApi = {
   grantDCT: (darId: string) => post(`/dct_approvals/${darId}/grant`),
   denyDCT: (darId: string) => post(`/dct_approvals/${darId}/deny`),
 
-  // Connections
-  listConnections: () => get<{ ok: boolean; connections: Connection[] }>("/connections"),
+  // Connections — kernel returns an object keyed by provider; normalize to array
+  listConnections: async () => {
+    const data = await get<{ ok: boolean; connections: Record<string, Omit<Connection, "provider"> & { status: Connection["status"] }> }>("/connections");
+    const connections: Connection[] = Object.entries(data.connections ?? {}).map(
+      ([provider, conn]) => ({ provider, ...conn } as Connection)
+    );
+    return { ok: data.ok, connections };
+  },
   saveConnection: (provider: string, fields: Record<string, string>) =>
     put(`/connections/${provider}`, fields),
   testConnection: (provider: string) => post(`/connections/${provider}/test`),
