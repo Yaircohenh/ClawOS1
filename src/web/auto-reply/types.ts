@@ -32,4 +32,10 @@ export type WebMonitorTuning = {
   accountId?: string;
   /** Debounce window (ms) for batching rapid consecutive messages from the same sender. */
   debounceMs?: number;
+  /**
+   * Optional tap called synchronously on each inbound message before the main handler.
+   * Used by the ClawOS bridge to forward messages without a second Baileys session.
+   * Errors thrown here must be caught by the caller; they must not propagate.
+   */
+  messageSink?: (msg: WebInboundMsg) => void;
 };

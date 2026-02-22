@@ -3,6 +3,7 @@ import Fastify from "fastify";
 import Database from "better-sqlite3";
 import { z } from "zod";
 import crypto from "crypto";
+import net from "node:net";
 import { dispatch as orchestratorDispatch } from "./orchestrator/index.js";
 import { logAudit } from "./orchestrator/logger.js";
 
@@ -59,6 +60,15 @@ CREATE TABLE IF NOT EXISTS tool_tokens (
   action_request_id TEXT NOT NULL,
   expires_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS connections (
+  provider TEXT PRIMARY KEY,
+  encrypted_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'unknown',
+  last_tested_at TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
 `);
 
 // Phase 3: delete expired tokens on every startup before accepting connections
@@ -97,6 +107,116 @@ function setKernelState(key, value) {
     value
   );
 }
+
+// --------------------
+// Connections — AES-256-GCM encryption helpers
+// --------------------
+function getConnectionsKey() {
+  let keyHex = getKernelState("connections_key");
+  if (!keyHex) {
+    keyHex = crypto.randomBytes(32).toString("hex");
+    setKernelState("connections_key", keyHex);
+  }
+  return Buffer.from(keyHex, "hex");
+}
+
+function encryptSecret(obj) {
+  const key = getConnectionsKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(obj), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  // Layout: [12 bytes iv][16 bytes tag][ciphertext]
+  return Buffer.concat([iv, tag, ciphertext]).toString("base64");
+}
+
+function decryptConnectionSecret(encryptedB64) {
+  const key = getConnectionsKey();
+  const buf = Buffer.from(encryptedB64, "base64");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const ciphertext = buf.subarray(28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return JSON.parse(Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8"));
+}
+
+function maskStr(s, prefixLen = 4, suffixLen = 4) {
+  if (!s || s.length <= prefixLen + suffixLen) {return s ? "•••" : null;}
+  return `${s.slice(0, prefixLen)}...${s.slice(-suffixLen)}`;
+}
+
+function testSmtp(host, port) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host, port: Number(port) || 25, timeout: 5000 });
+    let responded = false;
+    socket.once("data", (data) => {
+      responded = true;
+      socket.destroy();
+      const banner = data.toString();
+      if (banner.startsWith("220")) {resolve(true);}
+      else {reject(new Error(`Unexpected SMTP banner: ${banner.slice(0, 80).trim()}`));}
+    });
+    socket.once("error", reject);
+    socket.once("timeout", () => { socket.destroy(); reject(new Error("SMTP connect timeout")); });
+    // fallback if no data arrives
+    socket.once("connect", () => {
+      setTimeout(() => { if (!responded) { socket.destroy(); reject(new Error("SMTP no banner")); } }, 3000);
+    });
+  });
+}
+
+const PROVIDERS = {
+  brave: {
+    label: "Brave Search",
+    fields: ["api_key"],
+    mask: (s) => ({ api_key: maskStr(s.api_key) }),
+    test: async (s) => {
+      if (!s.api_key) {throw new Error("api_key is required");}
+      const r = await fetch("https://api.search.brave.com/res/v1/web/search?q=test&count=1", {
+        headers: { "Accept": "application/json", "X-Subscription-Token": s.api_key },
+      });
+      if (!r.ok) {throw new Error(`Brave API returned HTTP ${r.status}`);}
+      return true;
+    },
+  },
+  openai: {
+    label: "OpenAI",
+    fields: ["api_key"],
+    mask: (s) => ({ api_key: maskStr(s.api_key, 7, 4) }),
+    test: async (s) => {
+      if (!s.api_key) {throw new Error("api_key is required");}
+      const r = await fetch("https://api.openai.com/v1/models", {
+        headers: { "Authorization": `Bearer ${s.api_key}` },
+      });
+      if (!r.ok) {throw new Error(`OpenAI API returned HTTP ${r.status}`);}
+      return true;
+    },
+  },
+  anthropic: {
+    label: "Anthropic",
+    fields: ["api_key"],
+    mask: (s) => ({ api_key: maskStr(s.api_key, 7, 4) }),
+    test: async (s) => {
+      if (!s.api_key) {throw new Error("api_key is required");}
+      const r = await fetch("https://api.anthropic.com/v1/models", {
+        headers: { "x-api-key": s.api_key, "anthropic-version": "2023-06-01" },
+      });
+      if (!r.ok) {throw new Error(`Anthropic API returned HTTP ${r.status}`);}
+      return true;
+    },
+  },
+  smtp: {
+    label: "SMTP",
+    fields: ["host", "port", "user", "password"],
+    mask: (s) => ({ host: s.host || null, port: s.port || null, user: s.user || null, password: s.password ? "•••••••" : null }),
+    test: async (s) => {
+      if (!s.host) {throw new Error("host is required");}
+      await testSmtp(s.host, Number(s.port) || 587);
+      return true;
+    },
+  },
+};
 
 // --------------------
 // Lock / Setup
@@ -455,6 +575,108 @@ app.post("/kernel/tokens/verify", async (req, reply) => {
   }
 
   return { ok: true };
+});
+
+// --------------------
+// Connections
+// --------------------
+app.get("/kernel/connections", async () => {
+  const rows = db.prepare(`SELECT * FROM connections`).all();
+  const connections = {};
+  for (const [provider, def] of Object.entries(PROVIDERS)) {
+    const row = rows.find((r) => r.provider === provider);
+    if (!row) {
+      connections[provider] = { status: "missing", label: def.label, fields: def.fields };
+      continue;
+    }
+    let masked = {};
+    try {
+      masked = def.mask(decryptConnectionSecret(row.encrypted_json));
+    } catch { /* corrupt entry — show empty masked */ }
+    connections[provider] = {
+      status: row.status,
+      label: def.label,
+      fields: def.fields,
+      masked,
+      last_tested_at: row.last_tested_at,
+      last_error: row.last_error,
+      updated_at: row.updated_at,
+    };
+  }
+  return { ok: true, connections };
+});
+
+app.put("/kernel/connections/:provider", async (req, reply) => {
+  const { provider } = req.params;
+  const def = PROVIDERS[provider];
+  if (!def) { reply.code(400); return { ok: false, error: "unknown_provider" }; }
+
+  const body = req.body ?? {};
+  const incoming = {};
+  for (const field of def.fields) {
+    if (body[field] !== undefined && body[field] !== "") {incoming[field] = String(body[field]);}
+  }
+  if (Object.keys(incoming).length === 0) {
+    reply.code(400); return { ok: false, error: "no_fields_provided" };
+  }
+
+  // Merge with existing secrets (supports partial updates)
+  const existingRow = db.prepare(`SELECT encrypted_json FROM connections WHERE provider=?`).get(provider);
+  let existing = {};
+  if (existingRow) {
+    try { existing = decryptConnectionSecret(existingRow.encrypted_json); } catch { /* start fresh */ }
+  }
+  const merged = { ...existing, ...incoming };
+
+  db.prepare(`
+    INSERT INTO connections (provider, encrypted_json, status, updated_at)
+    VALUES (?, ?, 'unknown', ?)
+    ON CONFLICT(provider) DO UPDATE SET
+      encrypted_json = excluded.encrypted_json,
+      status = 'unknown',
+      last_error = NULL,
+      updated_at = excluded.updated_at
+  `).run(provider, encryptSecret(merged), nowIso());
+
+  return { ok: true, provider };
+});
+
+app.post("/kernel/connections/:provider/test", async (req, reply) => {
+  const { provider } = req.params;
+  const def = PROVIDERS[provider];
+  if (!def) { reply.code(400); return { ok: false, error: "unknown_provider" }; }
+
+  const row = db.prepare(`SELECT encrypted_json FROM connections WHERE provider=?`).get(provider);
+  if (!row) { reply.code(404); return { ok: false, error: "not_configured" }; }
+
+  let secrets;
+  try { secrets = decryptConnectionSecret(row.encrypted_json); }
+  catch { reply.code(500); return { ok: false, error: "decrypt_failed" }; }
+
+  let testOk = false;
+  let errorMsg = null;
+  try {
+    await def.test(secrets);
+    testOk = true;
+  } catch (e) {
+    errorMsg = e.message;
+  }
+
+  const now = nowIso();
+  db.prepare(`UPDATE connections SET status=?, last_tested_at=?, last_error=? WHERE provider=?`)
+    .run(testOk ? "connected" : "error", now, errorMsg, provider);
+
+  return { ok: testOk, provider, tested_at: now, ...(errorMsg ? { error: errorMsg } : {}) };
+});
+
+app.delete("/kernel/connections/:provider", async (req, reply) => {
+  const { provider } = req.params;
+  if (!PROVIDERS[provider]) { reply.code(400); return { ok: false, error: "unknown_provider" }; }
+
+  const { changes } = db.prepare(`DELETE FROM connections WHERE provider=?`).run(provider);
+  if (changes === 0) { reply.code(404); return { ok: false, error: "not_found" }; }
+
+  return { ok: true, provider };
 });
 
 // --------------------

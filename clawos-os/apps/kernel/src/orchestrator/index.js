@@ -113,7 +113,7 @@ export async function dispatch(raw, { db } = {}) {
   }
 
   try {
-    const out = await action.run(req, { started_at: started });
+    const out = await action.run(req, { started_at: started, db });
     const ms = Date.now() - started;
     logEvent({
       kind: "completed",

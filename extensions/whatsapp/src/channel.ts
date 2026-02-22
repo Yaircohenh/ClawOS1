@@ -441,6 +441,7 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> = {
         {
           statusSink: (next) => ctx.setStatus({ accountId: ctx.accountId, ...next }),
           accountId: account.accountId,
+          ...buildBridgeMessageSink(),
         },
       );
     },
@@ -463,3 +464,29 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> = {
     },
   },
 };
+
+/**
+ * ClawOS bridge tap.
+ * When BRIDGE_WEBHOOK_URL is set, returns a messageSink that fire-and-forgets
+ * each inbound message as a JSON POST to the bridge. Errors are swallowed so
+ * that bridge unavailability can never affect the WhatsApp connection.
+ */
+function buildBridgeMessageSink(): { messageSink?: (msg: Record<string, unknown>) => void } {
+  const bridgeUrl = process.env.BRIDGE_WEBHOOK_URL;
+  if (!bridgeUrl) return {};
+  const secret = process.env.BRIDGE_SECRET;
+  return {
+    messageSink: (msg: Record<string, unknown>) => {
+      // Strip non-serializable function fields before sending over HTTP.
+      const { sendComposing: _sc, reply: _r, sendMedia: _sm, ...payload } = msg;
+      void fetch(bridgeUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(secret ? { "x-bridge-secret": secret } : {}),
+        },
+        body: JSON.stringify(payload),
+      }).catch(() => {}); // Bridge failure must never crash the WhatsApp loop.
+    },
+  };
+}
