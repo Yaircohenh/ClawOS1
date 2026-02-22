@@ -468,12 +468,13 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> = {
 /**
  * ClawOS bridge tap.
  * When BRIDGE_WEBHOOK_URL is set, returns a messageSink that fire-and-forgets
- * each inbound message as a JSON POST to the bridge. Errors are swallowed so
- * that bridge unavailability can never affect the WhatsApp connection.
+ * each inbound message as a JSON POST to the bridge and returns `true` to
+ * consume the message — preventing the Claude agent from also processing it.
  *
- * Returns `true` for bridge command messages (!run, !approve, !deny) to signal
- * that they have been consumed and should NOT be forwarded to the Claude agent.
- * This prevents the Claude agent from seeing approval prompts and auto-approving.
+ * The bridge is the sole handler for all inbound messages: it classifies intent
+ * via Grok/Claude, routes to the appropriate kernel action, and manages the
+ * yes/no/more/edit approval UX. The Claude agent must not see any of these
+ * messages or it will produce a second, conflicting response.
  */
 function buildBridgeMessageSink(): {
   messageSink?: (msg: Record<string, unknown>) => boolean | void;
@@ -494,20 +495,9 @@ function buildBridgeMessageSink(): {
         body: JSON.stringify(payload),
       }).catch(() => {}); // Bridge failure must never crash the WhatsApp loop.
 
-      // Consume bridge commands so the Claude agent never sees them.
-      // The agent seeing "!approve ap_xxx" in its context would cause it to
-      // autonomously re-send the approval, creating a self-approval loop.
-      const body = String(msg.body ?? "");
-      if (body.startsWith("!run ") || body.startsWith("!approve ") || body.startsWith("!deny ")) {
-        return true;
-      }
-
-      // Consume PDF/document messages — the bridge handles them directly;
-      // the Claude agent should not also process the raw binary attachment.
-      const mediaPath = String(msg.mediaPath ?? "");
-      if (mediaPath && (mediaPath.endsWith(".pdf") || String(msg.mimeType ?? "").includes("pdf"))) {
-        return true;
-      }
+      // Always consume — the bridge owns all inbound message handling.
+      // Returning true prevents the Claude agent from producing a second response.
+      return true;
     },
   };
 }
