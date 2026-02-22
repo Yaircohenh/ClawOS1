@@ -9,6 +9,7 @@ import { action as writeFile } from "./actions/write_file.js";
 import { action as runShell } from "./actions/run_shell.js";
 import { action as summarizeDocument } from "./actions/summarize_document.js";
 import { action as classifyIntent } from "./actions/classify_intent.js";
+import { action as interpretResult } from "./actions/interpret_result.js";
 
 const registry = new Map([
   ["send_email", sendEmail],
@@ -18,6 +19,7 @@ const registry = new Map([
   ["run_shell", runShell],
   ["summarize_document", summarizeDocument],
   ["classify_intent", classifyIntent],
+  ["interpret_result", interpretResult],
 ]);
 
 // Fix #1+2: verify DB-issued cap tokens; db is passed in from the kernel route

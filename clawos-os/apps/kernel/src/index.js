@@ -7,6 +7,17 @@ import net from "node:net";
 import { dispatch as orchestratorDispatch } from "./orchestrator/index.js";
 import { logAudit } from "./orchestrator/logger.js";
 
+// ── Agent / Subagent / Task infrastructure ────────────────────────────────────
+import { createAgent, getAgent, assertAgent }                          from "./agents/service.js";
+import { spawnSubagent, getSubagent, assertSubagent, updateSubagentStatus } from "./subagents/service.js";
+import { createTask, getTask, updateTaskStatus }                       from "./tasks/service.js";
+import { emitEvent, getEvents }                                        from "./events/service.js";
+import { createArtifact, getArtifacts }                               from "./artifacts/service.js";
+import { evaluateScope }                                               from "./policy/engine.js";
+import { mintDCT, verifyDCT }                                         from "./tokens/delegation.js";
+import { runWorker }                                                   from "./workers/runner.js";
+import { verifyTask }                                                  from "./verify/service.js";
+
 const PORT = Number(process.env.KERNEL_PORT || 18888);
 const DB_PATH = process.env.DB_PATH || "./kernel.db";
 
@@ -77,6 +88,105 @@ CREATE TABLE IF NOT EXISTS risk_policies (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (action_type, workspace_id)
 );
+
+-- ── Agent / Subagent / Task infrastructure (v2) ─────────────────────────────
+
+-- AGENT: durable, user-facing actor with stable identity and authority
+CREATE TABLE IF NOT EXISTS agents (
+  agent_id          TEXT PRIMARY KEY,
+  kind              TEXT NOT NULL DEFAULT 'agent',     -- always 'agent'
+  workspace_id      TEXT NOT NULL,
+  role              TEXT NOT NULL DEFAULT 'orchestrator',
+  policy_profile_id TEXT,
+  created_at        TEXT NOT NULL
+);
+
+-- SUBAGENT: ephemeral delegate, always bound to a parent agent + task
+CREATE TABLE IF NOT EXISTS subagents (
+  subagent_id      TEXT PRIMARY KEY,
+  kind             TEXT NOT NULL DEFAULT 'subagent',   -- always 'subagent'
+  parent_agent_id  TEXT NOT NULL,                      -- MUST reference an agent
+  workspace_id     TEXT NOT NULL,
+  task_id          TEXT NOT NULL,                      -- MUST reference a task
+  step_id          TEXT,
+  worker_type      TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'created',    -- created/running/finished/failed
+  created_at       TEXT NOT NULL,
+  finished_at      TEXT
+);
+
+-- TASK: contract-first unit of work
+CREATE TABLE IF NOT EXISTS tasks (
+  task_id              TEXT PRIMARY KEY,
+  workspace_id         TEXT NOT NULL,
+  created_by_agent_id  TEXT NOT NULL,                  -- AGENT only
+  title                TEXT NOT NULL,
+  intent               TEXT NOT NULL DEFAULT '',
+  contract_json        TEXT NOT NULL,                  -- { objective, scope, deliverables, acceptance_checks }
+  plan_json            TEXT,                           -- { steps[], delegation_plan{} }
+  status               TEXT NOT NULL DEFAULT 'queued', -- queued/running/blocked/needs_approval/failed/succeeded
+  created_at           TEXT NOT NULL,
+  updated_at           TEXT NOT NULL
+);
+
+-- DCT: Delegation Capability Token — the ONLY way subagents get authority
+CREATE TABLE IF NOT EXISTS dct_tokens (
+  token_id         TEXT PRIMARY KEY,
+  workspace_id     TEXT NOT NULL,
+  issued_to_kind   TEXT NOT NULL,   -- 'agent' | 'subagent'
+  issued_to_id     TEXT NOT NULL,
+  parent_agent_id  TEXT,            -- required when issued_to_kind='subagent'
+  task_id          TEXT,
+  scope_json       TEXT NOT NULL,   -- { allowed_tools[], operations[], resource_constraints{} }
+  ttl_seconds      INTEGER NOT NULL DEFAULT 600,
+  expires_at       TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  revoked          INTEGER NOT NULL DEFAULT 0
+);
+
+-- DCT Approval Requests — separate from action-request approvals
+-- Only agents may request these; subagents cannot.
+CREATE TABLE IF NOT EXISTS dct_approval_requests (
+  dar_id                TEXT PRIMARY KEY,
+  workspace_id          TEXT NOT NULL,
+  requested_by_agent_id TEXT NOT NULL,
+  issue_to_kind         TEXT NOT NULL,
+  issue_to_id           TEXT NOT NULL,
+  task_id               TEXT,
+  scope_json            TEXT NOT NULL,
+  ttl_seconds           INTEGER NOT NULL DEFAULT 600,
+  risk_level            TEXT NOT NULL,
+  status                TEXT NOT NULL DEFAULT 'pending',  -- pending/granted/denied
+  expires_at            TEXT NOT NULL,
+  created_at            TEXT NOT NULL,
+  decided_at            TEXT
+);
+
+-- ARTIFACTS: verifiable outputs from agents/subagents
+CREATE TABLE IF NOT EXISTS artifacts (
+  artifact_id   TEXT PRIMARY KEY,
+  task_id       TEXT NOT NULL,
+  workspace_id  TEXT NOT NULL,
+  actor_kind    TEXT NOT NULL,    -- 'agent' | 'subagent' | 'system'
+  actor_id      TEXT NOT NULL,
+  type          TEXT NOT NULL,
+  content       TEXT,
+  uri           TEXT,
+  metadata_json TEXT,
+  created_at    TEXT NOT NULL
+);
+
+-- EVENTS: structured event stream per task
+CREATE TABLE IF NOT EXISTS task_events (
+  event_id      TEXT PRIMARY KEY,
+  workspace_id  TEXT NOT NULL,
+  task_id       TEXT NOT NULL,
+  actor_kind    TEXT NOT NULL,    -- 'agent' | 'subagent' | 'system'
+  actor_id      TEXT NOT NULL,
+  type          TEXT NOT NULL,
+  ts            TEXT NOT NULL,
+  data_json     TEXT NOT NULL
+);
 `);
 
 // Seed default risk policies (auto for read actions, ask for write/side-effect actions)
@@ -86,6 +196,7 @@ CREATE TABLE IF NOT EXISTS risk_policies (
     { action_type: "read_file",         mode: "auto" },
     { action_type: "summarize_document",mode: "auto" },
     { action_type: "classify_intent",   mode: "auto" },
+    { action_type: "interpret_result",  mode: "auto" },
     { action_type: "write_file",        mode: "ask"  },
     { action_type: "run_shell",         mode: "ask"  },
     { action_type: "send_email",        mode: "ask"  },
@@ -741,6 +852,517 @@ app.put("/kernel/risk_policies/:action_type", async (req, _reply) => {
     ON CONFLICT(action_type, workspace_id) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at
   `).run(action_type, body.workspace_id, body.mode, nowIso());
   return { ok: true, action_type, workspace_id: body.workspace_id, mode: body.mode };
+});
+
+// ============================================================================
+// AGENTS — POST /kernel/agents  &  GET /kernel/agents/:agent_id
+// Only agents can create tasks, request approvals, and mint delegation tokens.
+// ============================================================================
+
+app.post("/kernel/agents", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({
+    workspace_id:     z.string(),
+    agent_id:         z.string().min(1),
+    role:             z.string().optional().default("orchestrator"),
+    policy_profile_id: z.string().optional().nullable(),
+  });
+  const body = Schema.parse(req.body ?? {});
+
+  // Workspace must exist
+  const wsRow = db.prepare(`SELECT workspace_id FROM workspaces WHERE workspace_id=?`).get(body.workspace_id);
+  if (!wsRow) { reply.code(404); return { ok: false, error: "workspace_not_found" }; }
+
+  const agent = createAgent(db, body);
+
+  emitEvent(db, {
+    workspace_id: body.workspace_id,
+    task_id:      "system",
+    actor_kind:   "system",
+    actor_id:     "kernel",
+    type:         "agent.registered",
+    data:         { agent_id: body.agent_id, role: body.role },
+  });
+
+  return { ok: true, agent };
+});
+
+app.get("/kernel/agents/:agent_id", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+  const agent = getAgent(db, req.params.agent_id);
+  if (!agent) { reply.code(404); return { ok: false, error: "agent_not_found" }; }
+  return { ok: true, agent };
+});
+
+// ============================================================================
+// TASKS — POST /kernel/tasks  &  GET /kernel/tasks/:task_id
+// Contract-first: every task has objective, scope, deliverables, acceptance_checks.
+// Only AGENT may create a task.
+// ============================================================================
+
+app.post("/kernel/tasks", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({
+    workspace_id:         z.string(),
+    created_by_agent_id:  z.string(),
+    title:                z.string().min(1),
+    intent:               z.string().optional().default(""),
+    contract: z.object({
+      objective:        z.string().optional().default(""),
+      scope:            z.any().optional().default({}),
+      deliverables:     z.array(z.string()).optional().default([]),
+      acceptance_checks: z.array(z.any()).optional().default([]),
+    }).optional().default({}),
+    plan: z.any().optional().nullable(),
+  });
+  const body = Schema.parse(req.body ?? {});
+
+  // Validate AGENT identity
+  try {
+    assertAgent(db, body.created_by_agent_id, body.workspace_id);
+  } catch (err) {
+    reply.code(err.code ?? 403);
+    return { ok: false, error: err.message };
+  }
+
+  const task = createTask(db, body);
+
+  emitEvent(db, {
+    workspace_id: body.workspace_id,
+    task_id:      task.task_id,
+    actor_kind:   "agent",
+    actor_id:     body.created_by_agent_id,
+    type:         "task.created",
+    data:         { title: body.title, contract: body.contract },
+  });
+
+  return { ok: true, task_id: task.task_id, task };
+});
+
+app.get("/kernel/tasks/:task_id", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({ workspace_id: z.string() });
+  const query = Schema.parse(req.query ?? {});
+
+  const task = getTask(db, req.params.task_id);
+  if (!task) { reply.code(404); return { ok: false, error: "task_not_found" }; }
+  if (task.workspace_id !== query.workspace_id) { reply.code(403); return { ok: false, error: "workspace_mismatch" }; }
+
+  const artifacts = getArtifacts(db, task.task_id, task.workspace_id);
+  const subagents = db.prepare(`SELECT * FROM subagents WHERE task_id=? AND workspace_id=?`)
+    .all(task.task_id, task.workspace_id);
+
+  return { ok: true, task, artifacts, subagents };
+});
+
+// ── Task Artifacts ────────────────────────────────────────────────────────────
+
+app.post("/kernel/tasks/:task_id/artifacts", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({
+    workspace_id: z.string(),
+    actor_kind:   z.enum(["agent", "subagent", "system"]),
+    actor_id:     z.string(),
+    type:         z.string().min(1),
+    content:      z.string().optional().nullable(),
+    uri:          z.string().optional().nullable(),
+    metadata:     z.any().optional().default({}),
+  });
+  const body = Schema.parse(req.body ?? {});
+
+  const task = getTask(db, req.params.task_id);
+  if (!task) { reply.code(404); return { ok: false, error: "task_not_found" }; }
+  if (task.workspace_id !== body.workspace_id) { reply.code(403); return { ok: false, error: "workspace_mismatch" }; }
+
+  const artifact = createArtifact(db, { task_id: req.params.task_id, ...body });
+
+  emitEvent(db, {
+    workspace_id: body.workspace_id,
+    task_id:      req.params.task_id,
+    actor_kind:   body.actor_kind,
+    actor_id:     body.actor_id,
+    type:         "artifact.created",
+    data:         { artifact_id: artifact.artifact_id, type: body.type },
+  });
+
+  return { ok: true, artifact };
+});
+
+// ── Task Verify ───────────────────────────────────────────────────────────────
+
+app.post("/kernel/tasks/:task_id/verify", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({
+    workspace_id:         z.string(),
+    requested_by_agent_id: z.string(),
+  });
+  const body = Schema.parse(req.body ?? {});
+
+  // AGENT only — subagents cannot trigger verification
+  try {
+    assertAgent(db, body.requested_by_agent_id, body.workspace_id);
+  } catch (err) {
+    reply.code(err.code ?? 403);
+    return { ok: false, error: err.message };
+  }
+
+  const task = getTask(db, req.params.task_id);
+  if (!task) { reply.code(404); return { ok: false, error: "task_not_found" }; }
+  if (task.workspace_id !== body.workspace_id) { reply.code(403); return { ok: false, error: "workspace_mismatch" }; }
+
+  const result = await verifyTask(db, task, body.requested_by_agent_id);
+
+  if (result.passed) {
+    updateTaskStatus(db, task.task_id, "succeeded");
+  }
+
+  return { ok: true, ...result };
+});
+
+// ── Task Events ───────────────────────────────────────────────────────────────
+
+app.get("/kernel/tasks/:task_id/events", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({ workspace_id: z.string() });
+  const query = Schema.parse(req.query ?? {});
+
+  const task = getTask(db, req.params.task_id);
+  if (!task) { reply.code(404); return { ok: false, error: "task_not_found" }; }
+  if (task.workspace_id !== query.workspace_id) { reply.code(403); return { ok: false, error: "workspace_mismatch" }; }
+
+  const events = getEvents(db, req.params.task_id, query.workspace_id);
+  return { ok: true, task_id: req.params.task_id, event_count: events.length, events };
+});
+
+// ============================================================================
+// SUBAGENTS — POST /kernel/subagents  &  GET & /run
+// Subagents are ephemeral workers. They CANNOT request approvals or mint tokens.
+// They act only via a DCT issued by the kernel at the parent agent's request.
+// ============================================================================
+
+app.post("/kernel/subagents", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({
+    workspace_id:    z.string(),
+    parent_agent_id: z.string(),
+    task_id:         z.string(),
+    step_id:         z.string().optional().nullable(),
+    worker_type:     z.string().min(1),
+  });
+  const body = Schema.parse(req.body ?? {});
+
+  // AGENT identity required — only agents can spawn subagents
+  try {
+    assertAgent(db, body.parent_agent_id, body.workspace_id);
+  } catch (err) {
+    reply.code(err.code ?? 403);
+    return { ok: false, error: err.message };
+  }
+
+  // Task must exist in same workspace
+  const task = getTask(db, body.task_id);
+  if (!task) { reply.code(404); return { ok: false, error: "task_not_found" }; }
+  if (task.workspace_id !== body.workspace_id) { reply.code(403); return { ok: false, error: "task_workspace_mismatch" }; }
+
+  const subagent = spawnSubagent(db, body);
+
+  emitEvent(db, {
+    workspace_id: body.workspace_id,
+    task_id:      body.task_id,
+    actor_kind:   "agent",
+    actor_id:     body.parent_agent_id,
+    type:         "subagent.spawned",
+    data:         { subagent_id: subagent.subagent_id, worker_type: body.worker_type },
+  });
+
+  return { ok: true, subagent_id: subagent.subagent_id, subagent };
+});
+
+app.get("/kernel/subagents/:subagent_id", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({ workspace_id: z.string() });
+  const query = Schema.parse(req.query ?? {});
+
+  const sa = getSubagent(db, req.params.subagent_id);
+  if (!sa) { reply.code(404); return { ok: false, error: "subagent_not_found" }; }
+  if (sa.workspace_id !== query.workspace_id) { reply.code(403); return { ok: false, error: "workspace_mismatch" }; }
+
+  return { ok: true, subagent: sa };
+});
+
+/**
+ * POST /kernel/subagents/:subagent_id/run
+ *
+ * Subagent execution endpoint.
+ * The caller (typically the orchestrator on behalf of the subagent) provides:
+ *   - workspace_id
+ *   - token: the DCT bearer token issued to this subagent
+ *   - input: the worker's input payload
+ *
+ * Kernel enforces:
+ *   1. Subagent exists and belongs to workspace
+ *   2. DCT is valid (signature, expiry, not revoked)
+ *   3. DCT is issued TO this subagent (not another)
+ *   4. Subagent is in 'created' or 'running' state
+ */
+app.post("/kernel/subagents/:subagent_id/run", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({
+    workspace_id: z.string(),
+    token:        z.string(),   // DCT bearer token
+    input:        z.any().optional().default({}),
+  });
+  const body = Schema.parse(req.body ?? {});
+
+  // 1. Validate subagent
+  let sa;
+  try {
+    sa = assertSubagent(db, req.params.subagent_id, body.workspace_id);
+  } catch (err) {
+    reply.code(err.code ?? 403);
+    return { ok: false, error: err.message };
+  }
+
+  // 2. Verify DCT
+  const hmacKey = getKernelState("recovery_hash") ?? "dev";
+  const dct = verifyDCT(db, body.token, hmacKey);
+  if (!dct) {
+    reply.code(403);
+    return { ok: false, error: "invalid_or_expired_token" };
+  }
+
+  // 3. Token must be issued to THIS subagent
+  if (dct.issued_to_kind !== "subagent" || dct.issued_to_id !== req.params.subagent_id) {
+    reply.code(403);
+    return { ok: false, error: "token_not_bound_to_this_subagent" };
+  }
+
+  // 4. Subagent must be in a runnable state
+  if (!["created", "running"].includes(sa.status)) {
+    reply.code(409);
+    return { ok: false, error: `subagent_already_${sa.status}` };
+  }
+
+  updateSubagentStatus(db, req.params.subagent_id, "running");
+
+  try {
+    const { result, artifact_id } = await runWorker(db, {
+      subagent: sa,
+      token:    dct,
+      input:    body.input,
+    });
+
+    updateSubagentStatus(db, req.params.subagent_id, "finished");
+
+    return { ok: true, subagent_id: req.params.subagent_id, artifact_id, result };
+  } catch (err) {
+    updateSubagentStatus(db, req.params.subagent_id, "failed");
+    reply.code(500);
+    return { ok: false, error: err.message };
+  }
+});
+
+// ============================================================================
+// DELEGATION TOKENS — POST /kernel/tokens/request
+//
+// AGENT requests a DCT for itself or a subagent it owns.
+// Policy engine evaluates risk and determines if approval is needed.
+// Subagents CANNOT call this endpoint.
+// ============================================================================
+
+app.post("/kernel/tokens/request", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({
+    workspace_id:         z.string(),
+    requested_by_agent_id: z.string(),
+    issue_to: z.object({
+      kind: z.enum(["agent", "subagent"]),
+      id:   z.string(),
+    }),
+    task_id:    z.string().optional().nullable(),
+    scope: z.object({
+      allowed_tools:        z.array(z.string()).optional().default([]),
+      operations:           z.array(z.string()).optional().default([]),
+      resource_constraints: z.any().optional().default({}),
+    }),
+    ttl_seconds: z.number().int().positive().max(3600).optional().default(600),
+    dar_id:      z.string().optional().nullable(),  // DCT approval request ID (on retry)
+  });
+  const body = Schema.parse(req.body ?? {});
+
+  // ── 1. Validate requesting AGENT ──────────────────────────────────────────
+  try {
+    assertAgent(db, body.requested_by_agent_id, body.workspace_id);
+  } catch (err) {
+    reply.code(err.code ?? 403);
+    return { ok: false, error: err.message };
+  }
+
+  // ── 2. Validate issue_to target ───────────────────────────────────────────
+  if (body.issue_to.kind === "subagent") {
+    let sa;
+    try {
+      sa = assertSubagent(db, body.issue_to.id, body.workspace_id);
+    } catch (err) {
+      reply.code(err.code ?? 404);
+      return { ok: false, error: err.message };
+    }
+    // Subagent must belong to the requesting agent
+    if (sa.parent_agent_id !== body.requested_by_agent_id) {
+      reply.code(403);
+      return { ok: false, error: "subagent_not_owned_by_requesting_agent" };
+    }
+  } else if (body.issue_to.kind === "agent") {
+    // Agents can only request tokens for themselves (V1)
+    if (body.issue_to.id !== body.requested_by_agent_id) {
+      reply.code(403);
+      return { ok: false, error: "agents_may_only_request_tokens_for_themselves_v1" };
+    }
+  }
+
+  // ── 3. Evaluate risk + policy ─────────────────────────────────────────────
+  const policyResult = evaluateScope(body.scope, db);
+
+  if (policyResult.blocked) {
+    return {
+      ok:           false,
+      error:        "scope_blocked_by_policy",
+      blocked_tool: policyResult.blocked_tool,
+      risk_level:   policyResult.risk_level,
+    };
+  }
+
+  // ── 4. Approval gate ──────────────────────────────────────────────────────
+  if (policyResult.approval_required) {
+    // If a dar_id is provided, validate the approval was granted
+    if (body.dar_id) {
+      const dar = db.prepare(`SELECT * FROM dct_approval_requests WHERE dar_id=?`).get(body.dar_id);
+      if (!dar) {
+        reply.code(404);
+        return { ok: false, error: "dct_approval_not_found" };
+      }
+      if (dar.status !== "granted") {
+        reply.code(403);
+        return { ok: false, error: `dct_approval_${dar.status}`, dar_id: body.dar_id };
+      }
+      if (new Date(dar.expires_at).getTime() < Date.now()) {
+        reply.code(403);
+        return { ok: false, error: "dct_approval_expired", dar_id: body.dar_id };
+      }
+      // Validate the approval binds to the same agent + scope target
+      if (dar.requested_by_agent_id !== body.requested_by_agent_id) {
+        reply.code(403);
+        return { ok: false, error: "dct_approval_agent_mismatch" };
+      }
+      // Approval validated — fall through to mint
+    } else {
+      // No approval yet — create one and ask the user
+      const dar_id     = `dar_${crypto.randomBytes(12).toString("hex")}`;
+      const now        = new Date().toISOString();
+      const expires_at = new Date(Date.now() + body.ttl_seconds * 1000).toISOString();
+
+      db.prepare(`
+        INSERT INTO dct_approval_requests (
+          dar_id, workspace_id, requested_by_agent_id, issue_to_kind, issue_to_id,
+          task_id, scope_json, ttl_seconds, risk_level, status, expires_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+      `).run(
+        dar_id, body.workspace_id, body.requested_by_agent_id,
+        body.issue_to.kind, body.issue_to.id,
+        body.task_id ?? null, JSON.stringify(body.scope),
+        body.ttl_seconds, policyResult.risk_level,
+        expires_at, now,
+      );
+
+      return {
+        ok:            false,
+        needs_approval: true,
+        dar_id,
+        risk_level:    policyResult.risk_level,
+        scope:         body.scope,
+        message:       "Approval required. Grant via POST /kernel/dct_approvals/:dar_id/grant then retry with dar_id.",
+      };
+    }
+  }
+
+  // ── 5. Mint DCT ───────────────────────────────────────────────────────────
+  const hmacKey = getKernelState("recovery_hash") ?? "dev";
+  const dct = mintDCT(db, {
+    workspace_id:    body.workspace_id,
+    issued_to_kind:  body.issue_to.kind,
+    issued_to_id:    body.issue_to.id,
+    parent_agent_id: body.issue_to.kind === "subagent" ? body.requested_by_agent_id : null,
+    task_id:         body.task_id ?? null,
+    scope:           body.scope,
+    ttl_seconds:     body.ttl_seconds,
+    hmacKey,
+  });
+
+  // Emit token.issued event
+  if (body.task_id) {
+    emitEvent(db, {
+      workspace_id: body.workspace_id,
+      task_id:      body.task_id,
+      actor_kind:   "system",
+      actor_id:     "kernel",
+      type:         "token.issued",
+      data: {
+        token_id:       dct.token_id,
+        issued_to_kind: body.issue_to.kind,
+        issued_to_id:   body.issue_to.id,
+        risk_level:     policyResult.risk_level,
+        scope:          body.scope,
+      },
+    });
+  }
+
+  return {
+    ok:             true,
+    token_id:       dct.token_id,
+    token:          dct.token,
+    expires_at:     dct.expires_at,
+    issued_to_kind: body.issue_to.kind,
+    issued_to_id:   body.issue_to.id,
+    risk_level:     policyResult.risk_level,
+  };
+});
+
+// ── DCT Approval grant/deny ───────────────────────────────────────────────────
+
+app.post("/kernel/dct_approvals/:dar_id/grant", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const dar = db.prepare(`SELECT * FROM dct_approval_requests WHERE dar_id=?`).get(req.params.dar_id);
+  if (!dar) { reply.code(404); return { ok: false, error: "dct_approval_not_found" }; }
+  if (dar.status !== "pending") { reply.code(409); return { ok: false, error: `already_${dar.status}` }; }
+
+  db.prepare(`UPDATE dct_approval_requests SET status='granted', decided_at=? WHERE dar_id=?`)
+    .run(new Date().toISOString(), req.params.dar_id);
+
+  return { ok: true, dar_id: req.params.dar_id, status: "granted" };
+});
+
+app.post("/kernel/dct_approvals/:dar_id/deny", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const dar = db.prepare(`SELECT * FROM dct_approval_requests WHERE dar_id=?`).get(req.params.dar_id);
+  if (!dar) { reply.code(404); return { ok: false, error: "dct_approval_not_found" }; }
+  if (dar.status !== "pending") { reply.code(409); return { ok: false, error: `already_${dar.status}` }; }
+
+  db.prepare(`UPDATE dct_approval_requests SET status='denied', decided_at=? WHERE dar_id=?`)
+    .run(new Date().toISOString(), req.params.dar_id);
+
+  return { ok: true, dar_id: req.params.dar_id, status: "denied" };
 });
 
 // --------------------

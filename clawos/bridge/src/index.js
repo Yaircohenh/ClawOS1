@@ -82,6 +82,25 @@ async function ensureWorkspace(sender) {
   return wsId;
 }
 
+// ── LLM-powered result prettifier ────────────────────────────────────────────
+// Calls interpret_result on the kernel to get a friendly WhatsApp-formatted
+// reply. Falls back to formatResult() if interpret_result is unavailable.
+async function prettify(sender, wsId, actionType, rawOutput, originalQuery) {
+  try {
+    const cls = await submitActionRequest(wsId, sender, "interpret_result", {
+      action_type: actionType,
+      original_query: originalQuery,
+      raw_output: rawOutput,
+    });
+    if (cls.ok && cls.exec?.result?.formatted) {
+      return cls.exec.result.formatted;
+    }
+  } catch {
+    // Fall through to raw output
+  }
+  return rawOutput;
+}
+
 // ── Result formatter (shared by search + run) ─────────────────────────────────
 function formatResult(exec) {
   const inner = exec?.result ?? exec ?? {};
@@ -235,8 +254,15 @@ async function handleApprove(sender, approvalId) {
     clearPending(sender, approvalId);
 
     if (result.ok) {
-      const reply = formatResult(result.exec);
-      await sendWhatsApp(sender, `Done:\n\n${reply}`);
+      const raw = formatResult(result.exec);
+      const friendly = await prettify(
+        sender,
+        pending.workspace_id,
+        pending.action_type,
+        raw,
+        pending.original_query ?? "",
+      );
+      await sendWhatsApp(sender, friendly);
     } else {
       await sendWhatsApp(
         sender,
@@ -344,7 +370,7 @@ async function handleEditInput(sender, text, wsId) {
 }
 
 // ── !run <command> handler ────────────────────────────────────────────────────
-async function handleRun(sender, command, workspaceId) {
+async function handleRun(sender, command, workspaceId, originalQuery = command) {
   const result = await submitActionRequest(workspaceId, sender, "run_shell", { command });
 
   if (result.approval_id) {
@@ -356,6 +382,7 @@ async function handleRun(sender, command, workspaceId) {
       action_type: "run_shell",
       payload: { command },
       agent_id: sender,
+      original_query: originalQuery,
       risk_level: result.risk_level ?? "high",
       reversible: result.reversible ?? false,
       description: result.description ?? "Run a shell command on the system",
@@ -367,8 +394,9 @@ async function handleRun(sender, command, workspaceId) {
   }
 
   if (result.ok) {
-    const reply = formatResult(result.exec);
-    await sendWhatsApp(sender, reply);
+    const raw = formatResult(result.exec);
+    const friendly = await prettify(sender, workspaceId, "run_shell", raw, originalQuery);
+    await sendWhatsApp(sender, friendly);
     return;
   }
 
@@ -407,7 +435,7 @@ async function handleDocument(sender, msg, workspaceId) {
 }
 
 // ── Web search handler (direct, no classification) ────────────────────────────
-async function handleWebSearch(sender, query, workspaceId) {
+async function handleWebSearch(sender, query, workspaceId, originalQuery = query) {
   const result = await submitActionRequest(workspaceId, sender, "web_search", { q: query });
 
   if (result.approval_id) {
@@ -419,6 +447,7 @@ async function handleWebSearch(sender, query, workspaceId) {
       action_type: "web_search",
       payload: { q: query },
       agent_id: sender,
+      original_query: originalQuery,
       risk_level: result.risk_level ?? "low",
       reversible: result.reversible ?? true,
       description: result.description ?? "Search the web for information",
@@ -430,7 +459,9 @@ async function handleWebSearch(sender, query, workspaceId) {
   }
 
   if (result.ok) {
-    await sendWhatsApp(sender, formatResult(result.exec));
+    const raw = formatResult(result.exec);
+    const friendly = await prettify(sender, workspaceId, "web_search", raw, originalQuery);
+    await sendWhatsApp(sender, friendly);
     return;
   }
 
@@ -441,7 +472,7 @@ async function handleWebSearch(sender, query, workspaceId) {
 }
 
 // ── Generic action handler (write_file, read_file, etc.) ─────────────────────
-async function handleDirectAction(sender, actionType, params, workspaceId) {
+async function handleDirectAction(sender, actionType, params, workspaceId, originalQuery = "") {
   const result = await submitActionRequest(workspaceId, sender, actionType, params);
 
   if (result.approval_id) {
@@ -453,6 +484,7 @@ async function handleDirectAction(sender, actionType, params, workspaceId) {
       action_type: actionType,
       payload: params,
       agent_id: sender,
+      original_query: originalQuery,
       risk_level: result.risk_level ?? "medium",
       reversible: result.reversible ?? true,
       description: result.description ?? actionType,
@@ -464,7 +496,9 @@ async function handleDirectAction(sender, actionType, params, workspaceId) {
   }
 
   if (result.ok) {
-    await sendWhatsApp(sender, formatResult(result.exec ?? result));
+    const raw = formatResult(result.exec ?? result);
+    const friendly = await prettify(sender, workspaceId, actionType, raw, originalQuery);
+    await sendWhatsApp(sender, friendly);
     return;
   }
 
@@ -504,28 +538,28 @@ async function routeMessage(sender, text, workspaceId) {
 
     if (action_type === "run_shell" && confidence >= CONFIDENCE.run_shell) {
       const command = params?.command ?? text;
-      await handleRun(sender, command, workspaceId);
+      await handleRun(sender, command, workspaceId, text);
       return;
     }
 
     if (action_type === "write_file" && confidence >= CONFIDENCE.write_file) {
-      await handleDirectAction(sender, "write_file", params, workspaceId);
+      await handleDirectAction(sender, "write_file", params, workspaceId, text);
       return;
     }
 
     if (action_type === "read_file" && confidence >= CONFIDENCE.read_file) {
-      await handleDirectAction(sender, "read_file", params, workspaceId);
+      await handleDirectAction(sender, "read_file", params, workspaceId, text);
       return;
     }
 
     // web_search, none, or below-threshold confidence → web_search fallback
     const query = params?.q ?? text;
-    await handleWebSearch(sender, query, workspaceId);
+    await handleWebSearch(sender, query, workspaceId, text);
     return;
   }
 
   // Classification unavailable — fall back to web_search
-  await handleWebSearch(sender, text, workspaceId);
+  await handleWebSearch(sender, text, workspaceId, text);
 }
 
 // ── Inbound webhook ───────────────────────────────────────────────────────────
