@@ -6,9 +6,10 @@
  * bridge send server running inside the OpenClaw process.
  *
  * Supported WhatsApp commands:
- *   !approve <approval_id>  — approve a pending kernel action
- *   !deny <approval_id>     — reject a pending kernel action
- *   <anything else>         — submitted as web_search { q: <text> }
+ *   !run <shell command>   — submit run_shell (requires approval)
+ *   !approve <approval_id> — approve: issue cap token + execute
+ *   !deny <approval_id>    — reject a pending kernel action
+ *   <anything else>        — submitted as web_search { q: <text> }
  */
 import Fastify from "fastify";
 import {
@@ -16,6 +17,7 @@ import {
   submitActionRequest,
   approveActionRequest,
   denyActionRequest,
+  issueToken,
   kernelHealth,
 } from "./kernel.js";
 import {
@@ -72,20 +74,76 @@ async function ensureWorkspace(sender) {
   return wsId;
 }
 
-// ── !approve handler ──────────────────────────────────────────────────────────
+// ── Result formatter (shared by search + run) ─────────────────────────────────
+function formatResult(exec) {
+  const inner = exec?.result ?? exec ?? {};
+
+  // Brave search results
+  if (inner.mode === "brave" && Array.isArray(inner.results)) {
+    const lines = inner.results
+      .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet ?? ""}`.trim())
+      .join("\n\n");
+    return `Search: "${inner.query}"\n\n${lines}`;
+  }
+
+  // Shell output
+  if (inner.output !== undefined) {
+    const prefix = inner.ok === false ? "Exit " + inner.exit_code + "\n" : "";
+    return prefix + inner.output;
+  }
+
+  return (
+    inner.note ??
+    inner.text ??
+    (inner.ok === false
+      ? `Error: ${inner.message ?? JSON.stringify(inner)}`
+      : JSON.stringify(inner))
+  );
+}
+
+// ── !approve handler (full flow: approve → issue token → retry) ───────────────
 async function handleApprove(sender, approvalId) {
   const pending = getPendingApproval(approvalId);
   if (!pending) {
-    await sendWhatsApp(sender, `Unknown approval: ${approvalId}`);
+    await sendWhatsApp(sender, `Unknown approval ID: ${approvalId}`);
     return;
   }
   try {
+    // Step 1 — mark approved in kernel
     await approveActionRequest(approvalId);
+
+    // Step 2 — issue capability token bound to this workspace + request
+    const tokenRes = await issueToken(
+      pending.workspace_id,
+      pending.action_type,
+      pending.action_request_id,
+      approvalId,
+    );
+
+    // Step 3 — retry original action with the cap token (same request_id → idempotent)
+    const result = await submitActionRequest(
+      pending.workspace_id,
+      pending.agent_id,
+      pending.action_type,
+      pending.payload,
+      { requestId: pending.action_request_id, approvalToken: tokenRes.token },
+    );
+
     removePendingApproval(approvalId);
-    await sendWhatsApp(sender, `Approved: ${approvalId}`);
-    app.log.info({ sender, approvalId }, "approval granted");
+
+    if (result.ok) {
+      const reply = formatResult(result.exec);
+      await sendWhatsApp(sender, `Approved. Result:\n\n${reply}`);
+    } else {
+      await sendWhatsApp(
+        sender,
+        `Approved but execution failed: ${result.error ?? JSON.stringify(result)}`,
+      );
+    }
+    app.log.info({ sender, approvalId, action_type: pending.action_type }, "approved and executed");
   } catch (err) {
     await sendWhatsApp(sender, `Approval error: ${err.message}`);
+    app.log.error({ err, sender, approvalId }, "handleApprove failed");
   }
 }
 
@@ -93,7 +151,7 @@ async function handleApprove(sender, approvalId) {
 async function handleDeny(sender, approvalId) {
   const pending = getPendingApproval(approvalId);
   if (!pending) {
-    await sendWhatsApp(sender, `Unknown approval: ${approvalId}`);
+    await sendWhatsApp(sender, `Unknown approval ID: ${approvalId}`);
     return;
   }
   try {
@@ -106,14 +164,51 @@ async function handleDeny(sender, approvalId) {
   }
 }
 
-// ── Normal message handler ────────────────────────────────────────────────────
+// ── !run <command> handler ────────────────────────────────────────────────────
+async function handleRun(sender, command, workspaceId) {
+  const result = await submitActionRequest(workspaceId, sender, "run_shell", { command });
+
+  if (result.approval_id) {
+    const { approval_id, action_request_id } = result;
+    savePendingApproval(approval_id, {
+      sender,
+      workspace_id: workspaceId,
+      action_request_id,
+      action_type: "run_shell",
+      payload: { command },
+      agent_id: sender,
+    });
+    await sendWhatsApp(
+      sender,
+      `Approval required to run:\n> ${command}\n\nID: ${approval_id}\n\nReply:\n!approve ${approval_id}`,
+    );
+    app.log.info({ sender, approval_id, command }, "run_shell approval required");
+    return;
+  }
+
+  if (result.ok) {
+    const reply = formatResult(result.exec);
+    await sendWhatsApp(sender, reply);
+    return;
+  }
+
+  await sendWhatsApp(sender, `Kernel error: ${result.error?.message ?? JSON.stringify(result)}`);
+}
+
+// ── Normal message handler (web_search) ───────────────────────────────────────
 async function handleMessage(sender, text, workspaceId) {
   const result = await submitActionRequest(workspaceId, sender, "web_search", { q: text });
 
   if (result.approval_id) {
-    // Kernel returned approval_required — store it and prompt the user.
     const { approval_id, action_request_id } = result;
-    savePendingApproval(approval_id, { sender, workspace_id: workspaceId, action_request_id });
+    savePendingApproval(approval_id, {
+      sender,
+      workspace_id: workspaceId,
+      action_request_id,
+      action_type: "web_search",
+      payload: { q: text },
+      agent_id: sender,
+    });
     await sendWhatsApp(
       sender,
       `Blocked. Approval needed: ${approval_id}\nReply: !approve ${approval_id}`,
@@ -123,24 +218,14 @@ async function handleMessage(sender, text, workspaceId) {
   }
 
   if (result.ok) {
-    // Kernel wraps the orchestrator result under exec.result.
-    // exec shape: { ok, request_id, action_type, result: { ok, mode, query, note, ... }, ms }
-    const exec = result.exec ?? {};
-    const inner = exec.result ?? exec;
-    const reply =
-      inner.note ??
-      inner.output ??
-      inner.text ??
-      (inner.ok === false
-        ? `Error: ${inner.message ?? JSON.stringify(inner)}`
-        : JSON.stringify(inner));
-    await sendWhatsApp(sender, `${reply}`);
+    await sendWhatsApp(sender, formatResult(result.exec));
     return;
   }
 
-  // Unexpected response shape — surface it.
-  const errMsg = result.error?.message ?? JSON.stringify(result.error ?? result);
-  await sendWhatsApp(sender, `Kernel error: ${errMsg}`);
+  await sendWhatsApp(
+    sender,
+    `Kernel error: ${result.error?.message ?? JSON.stringify(result.error ?? result)}`,
+  );
 }
 
 // ── Inbound webhook ───────────────────────────────────────────────────────────
@@ -148,8 +233,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
   const msg = req.body ?? {};
   const text = String(msg.body ?? "").trim();
 
-  // Resolve the canonical sender identifier.
-  // DMs: prefer E.164; Groups: use senderJid; fallback to the conversation `from`.
+  // DMs: prefer E.164; Groups: use senderJid; fallback to `from`.
   const sender = msg.senderE164 ?? msg.senderJid ?? msg.from;
 
   if (!text || !sender) {
@@ -173,6 +257,27 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     await handleDeny(sender, approvalId).catch((err) =>
       app.log.error({ err, sender, approvalId }, "handleDeny failed"),
     );
+    return { ok: true };
+  }
+
+  // ── !run <command> ────────────────────────────────────────────────────────
+  if (text.startsWith("!run ")) {
+    const command = text.slice("!run ".length).trim();
+    if (!command) {
+      await sendWhatsApp(sender, "Usage: !run <shell command>").catch(() => {});
+      return { ok: true };
+    }
+    let wsId;
+    try {
+      wsId = await ensureWorkspace(sender);
+    } catch (err) {
+      await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
+      return reply.code(500).send({ error: "workspace_error" });
+    }
+    await handleRun(sender, command, wsId).catch((err) => {
+      app.log.error({ err, sender, command }, "handleRun failed");
+      sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
+    });
     return { ok: true };
   }
 

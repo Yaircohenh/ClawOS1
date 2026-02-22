@@ -47,13 +47,21 @@ export async function createWorkspace() {
  * Returns the full kernel response:
  *   success          → { ok: true, action_request_id, exec: { ... } }
  *   approval needed  → { approval_required: true, action_request_id, approval_id, approval_expires_at, ... }
+ *
+ * @param {string}  workspaceId
+ * @param {string}  agentId
+ * @param {string}  actionType
+ * @param {object}  payload
+ * @param {{ requestId?: string, approvalToken?: string }} [opts]
  */
-export async function submitActionRequest(workspaceId, agentId, actionType, payload) {
+export async function submitActionRequest(workspaceId, agentId, actionType, payload, opts = {}) {
   return post("/kernel/action_requests", {
     workspace_id: workspaceId,
     agent_id: agentId,
     action_type: actionType,
     payload,
+    ...(opts.requestId ? { request_id: opts.requestId } : {}),
+    ...(opts.approvalToken ? { approval_token: opts.approvalToken } : {}),
   });
 }
 
@@ -71,6 +79,24 @@ export async function approveActionRequest(approvalId) {
  */
 export async function denyActionRequest(approvalId) {
   return post(`/kernel/approvals/${approvalId}/reject`, {});
+}
+
+/**
+ * Issue a capability token after an approval has been granted.
+ * Returns { ok: true, token, expires_at }.
+ *
+ * @param {string} workspaceId
+ * @param {string} toolName        — must match action_type (e.g. "run_shell")
+ * @param {string} actionRequestId
+ * @param {string} approvalId
+ */
+export async function issueToken(workspaceId, toolName, actionRequestId, approvalId) {
+  return post("/kernel/tokens/issue", {
+    workspace_id: workspaceId,
+    tool_name: toolName,
+    action_request_id: actionRequestId,
+    approval_id: approvalId,
+  });
 }
 
 /**
