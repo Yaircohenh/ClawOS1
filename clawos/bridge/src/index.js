@@ -32,6 +32,11 @@ import {
   kernelRunSubagent,
   kernelResolveSession,
   kernelUpdateSession,
+  kernelResolveObjective,
+  kernelUpdateObjective,
+  kernelAddToolEvidence,
+  kernelCognitivePhase,
+  kernelAddSessionTurn,
 } from "./kernel.js";
 import { extractPdfText } from "./pdf.js";
 import {
@@ -292,15 +297,20 @@ async function routeViaAgent(
   originalQuery,
   sessionId = null,
   contextSummary = "",
+  objectiveId = null,
+  objectiveGoal = "",
 ) {
   const meta = ACTION_META[actionType] ?? ACTION_META.web_search;
   const input = buildWorkerInput(actionType, params);
   const title = `${actionType}: ${originalQuery?.slice(0, 60) ?? actionType}`;
 
-  // Build task objective — include session context so the worker has prior turn info
-  const objective = contextSummary
-    ? `${originalQuery ?? actionType}\n\n--- Session context ---\n${contextSummary}`
-    : (originalQuery ?? actionType);
+  // Build task objective — include cognitive objective goal + session context
+  const taskObjective = [
+    objectiveGoal || originalQuery || actionType,
+    contextSummary ? `--- Session context ---\n${contextSummary}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   // 1. Create contract-first task
   let taskRes;
@@ -310,7 +320,7 @@ async function routeViaAgent(
       sender,
       title,
       {
-        objective,
+        objective: taskObjective,
         scope: { tools: meta.scope.allowed_tools },
         deliverables: ["result"],
         acceptance_checks: [{ type: "min_artifacts", count: 1 }],
@@ -367,7 +377,7 @@ async function routeViaAgent(
       task_id: taskId,
       workspace_id: workspaceId,
       action_type: actionType,
-      payload: params, // kept for buildApprovalMessage / buildMoreMessage compat
+      payload: params,
       scope: meta.scope,
       original_query: originalQuery,
       agent_id: sender,
@@ -375,14 +385,22 @@ async function routeViaAgent(
       description: meta.description,
       reversible: meta.reversible,
       editing: false,
-      // Session context — preserved through the approval round-trip
+      // Session + cognitive context — preserved through the approval round-trip
       session_id: sessionId,
       context_summary: contextSummary,
+      objective_id: objectiveId,
+      objective_goal: objectiveGoal,
     };
     setSenderPending(sender, pendingData);
     await sendWhatsApp(sender, buildApprovalMessage(pendingData));
     app.log.info(
-      { sender, dar_id: dctRes.dar_id, actionType, session_id: sessionId },
+      {
+        sender,
+        dar_id: dctRes.dar_id,
+        actionType,
+        session_id: sessionId,
+        objective_id: objectiveId,
+      },
       "dct_approval required",
     );
     return;
@@ -398,12 +416,22 @@ async function routeViaAgent(
     input,
     originalQuery,
     sessionId,
+    objectiveId,
   );
 }
 
 /**
- * Execute a subagent and send the prettified result to the user.
+ * Execute a subagent and send the validated, truth-checked result to the user.
  * Shared by the auto path and the post-approval path.
+ *
+ * Cognitive pipeline added here:
+ *   1. Record real tool evidence in kernel (for tool-truth gate)
+ *   2. Prettify raw output
+ *   3. Enforce tool-truth (strip false claims if no evidence)
+ *   4. Validate deliverable (count + format check)
+ *   5. Auto-repair once if deliverable incomplete
+ *   6. Send final output
+ *   7. Update session context + turns
  */
 async function _executeSubagent(
   sender,
@@ -414,6 +442,7 @@ async function _executeSubagent(
   input,
   originalQuery,
   sessionId = null,
+  objectiveId = null,
 ) {
   let runRes;
   try {
@@ -424,25 +453,149 @@ async function _executeSubagent(
     return;
   }
 
-  if (runRes.ok) {
-    // result is the dispatch output from the worker; formatResult handles all known shapes
-    const raw = formatResult(runRes.result ?? runRes);
-    const friendly = await prettify(sender, workspaceId, actionType, raw, originalQuery ?? "");
-    await sendWhatsApp(sender, friendly);
-    app.log.info(
-      { sender, subagent_id: subagentId, actionType, session_id: sessionId },
-      "subagent executed",
-    );
-
-    // Advance session context — non-fatal, fire-and-forget
-    if (sessionId) {
-      kernelUpdateSession(sessionId, workspaceId, originalQuery ?? "", friendly, actionType).catch(
-        (err) =>
-          app.log.warn({ err, session_id: sessionId }, "session context update failed — non-fatal"),
-      );
-    }
-  } else {
+  if (!runRes.ok) {
     await sendWhatsApp(sender, `Kernel error: ${runRes.error ?? JSON.stringify(runRes)}`);
+    return;
+  }
+
+  // ── 1. Record tool evidence ────────────────────────────────────────────────
+  if (objectiveId && sessionId) {
+    const queryText = input?.query ?? input?.command ?? input?.q ?? originalQuery ?? "";
+    const resultSummary = String(runRes.result?.output ?? runRes.result?.note ?? "").slice(0, 500);
+    kernelAddToolEvidence(objectiveId, sessionId, {
+      action_type: actionType,
+      query_text: queryText,
+      result_summary: resultSummary,
+    }).catch((err) =>
+      app.log.warn({ err, objective_id: objectiveId }, "evidence record failed — non-fatal"),
+    );
+  }
+
+  // ── 2. Prettify raw output ─────────────────────────────────────────────────
+  const raw = formatResult(runRes.result ?? runRes);
+  let friendly = await prettify(sender, workspaceId, actionType, raw, originalQuery ?? "");
+
+  // ── 3. Tool-truth enforcement ──────────────────────────────────────────────
+  let toolTruthPassed = true;
+  let toolRepairTriggered = false;
+  if (objectiveId) {
+    try {
+      const truthRes = await kernelCognitivePhase(workspaceId, sender, "enforce_tool_truth", {
+        output: friendly,
+        objective_id: objectiveId,
+      });
+      if (truthRes.ok && truthRes.exec?.result) {
+        const tr = truthRes.exec.result;
+        toolTruthPassed = tr.passed;
+        toolRepairTriggered = tr.tool_repair_triggered ?? false;
+        if (!tr.passed && tr.sanitized_output) {
+          friendly = tr.sanitized_output;
+        }
+        app.log.info(
+          {
+            sender,
+            objective_id: objectiveId,
+            tool_truth_check: tr.passed ? "pass" : "fail",
+            claims_found: tr.claims_found,
+            tool_repair_triggered: toolRepairTriggered,
+          },
+          "cognitive: tool_truth_check",
+        );
+      }
+    } catch (err) {
+      app.log.warn({ err }, "tool_truth enforcement failed — non-fatal");
+    }
+  }
+
+  // ── 4+5. Deliverable validation + auto-repair ──────────────────────────────
+  let deliverableCheck = "skip";
+  let repairAttempts = 0;
+  if (objectiveId) {
+    try {
+      const valRes = await kernelCognitivePhase(workspaceId, sender, "validate_deliverable", {
+        output: friendly,
+        objective_id: objectiveId,
+      });
+      if (valRes.ok && valRes.exec?.result) {
+        const vr = valRes.exec.result;
+        deliverableCheck = vr.passed ? "pass" : "fail";
+        app.log.info(
+          {
+            sender,
+            objective_id: objectiveId,
+            deliverable_check: deliverableCheck,
+            item_count: vr.item_count,
+            required_count: vr.required_count,
+            failures: vr.failures,
+          },
+          "cognitive: deliverable_check",
+        );
+
+        // Auto-repair once if validation failed
+        if (!vr.passed && vr.required_count > 0) {
+          repairAttempts = 1;
+          const repairRes = await kernelCognitivePhase(workspaceId, sender, "repair_deliverable", {
+            original_output: friendly,
+            objective_id: objectiveId,
+            tool_capabilities: { web_search: actionType === "web_search" },
+          });
+          if (repairRes.ok && repairRes.exec?.result?.ok && repairRes.exec.result.repaired_output) {
+            friendly = repairRes.exec.result.repaired_output;
+            deliverableCheck = "repaired";
+            app.log.info(
+              { sender, objective_id: objectiveId, repair_attempts: repairAttempts },
+              "cognitive: deliverable_repaired",
+            );
+          } else {
+            // Repair also failed — append structured failure note
+            friendly += `\n\n_(Deliverable incomplete — objective still in progress.)_`;
+            deliverableCheck = "fail_unrepaired";
+          }
+        }
+
+        // Mark objective complete if deliverable passed
+        if (deliverableCheck === "pass" || deliverableCheck === "repaired") {
+          kernelUpdateObjective(objectiveId, {
+            status: "completed",
+            result_summary: friendly.slice(0, 500),
+          }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      app.log.warn({ err }, "deliverable validation failed — non-fatal");
+    }
+  }
+
+  // ── 6. Send final output ───────────────────────────────────────────────────
+  await sendWhatsApp(sender, friendly);
+  app.log.info(
+    {
+      sender,
+      subagent_id: subagentId,
+      actionType,
+      session_id: sessionId,
+      objective_id: objectiveId,
+      tool_truth_check: toolTruthPassed ? "pass" : "fail",
+      deliverable_check: deliverableCheck,
+      repair_attempts: repairAttempts,
+      tool_repair_triggered: toolRepairTriggered,
+    },
+    "subagent executed",
+  );
+
+  // ── 7. Update session context + turns ─────────────────────────────────────
+  if (sessionId) {
+    kernelUpdateSession(sessionId, workspaceId, originalQuery ?? "", friendly, actionType).catch(
+      (err) =>
+        app.log.warn({ err, session_id: sessionId }, "session context update failed — non-fatal"),
+    );
+  }
+  if (objectiveId && sessionId) {
+    void kernelAddSessionTurn(objectiveId, sessionId, {
+      user_message: originalQuery ?? "",
+      assistant_response: friendly,
+      action_type: actionType,
+    });
   }
 }
 
@@ -557,9 +710,16 @@ async function handleDCTApprove(sender, sp) {
       input,
       sp.original_query,
       sp.session_id ?? null,
+      sp.objective_id ?? null,
     );
     app.log.info(
-      { sender, dar_id: sp.dar_id, action_type: sp.action_type, session_id: sp.session_id ?? null },
+      {
+        sender,
+        dar_id: sp.dar_id,
+        action_type: sp.action_type,
+        session_id: sp.session_id ?? null,
+        objective_id: sp.objective_id ?? null,
+      },
       "dct approved and executed",
     );
   } catch (err) {
@@ -651,20 +811,18 @@ async function handleEditInput(sender, text, wsId) {
     return;
   }
 
-  // Preserve session context through the edit round-trip
+  // Preserve session + cognitive context through the edit round-trip
   const sessionId = sp.session_id ?? null;
   const contextSummary = sp.context_summary ?? "";
+  const objectiveId = sp.objective_id ?? null;
+  const objectiveGoal = sp.objective_goal ?? "";
 
-  // Discard the old pending.
-  // For DCT-pending: the old subagent/task stay in DB as orphaned (they'll never run).
-  // For legacy pending: orphan the action request.
   if (sp.approval_id) {
     removePendingApproval(sp.approval_id);
   }
   clearSenderPending(sender);
 
   if (sp.action_type === "run_shell") {
-    // Shell edit: use the new text as-is (no re-classification — user knows what they want)
     await routeViaAgent(
       sender,
       wsId,
@@ -673,10 +831,11 @@ async function handleEditInput(sender, text, wsId) {
       text,
       sessionId,
       contextSummary,
+      objectiveId,
+      objectiveGoal,
     );
   } else {
-    // All other edits: re-classify (user may have pivoted intent)
-    await routeMessage(sender, text, wsId, sessionId, contextSummary);
+    await routeMessage(sender, text, wsId, sessionId, contextSummary, objectiveId, objectiveGoal);
   }
 }
 
@@ -688,6 +847,8 @@ async function handleRun(
   originalQuery = command,
   sessionId = null,
   contextSummary = "",
+  objectiveId = null,
+  objectiveGoal = "",
 ) {
   await routeViaAgent(
     sender,
@@ -697,6 +858,8 @@ async function handleRun(
     originalQuery,
     sessionId,
     contextSummary,
+    objectiveId,
+    objectiveGoal,
   );
 }
 
@@ -739,6 +902,8 @@ async function handleWebSearch(
   originalQuery = query,
   sessionId = null,
   contextSummary = "",
+  objectiveId = null,
+  objectiveGoal = "",
 ) {
   await routeViaAgent(
     sender,
@@ -748,6 +913,8 @@ async function handleWebSearch(
     originalQuery,
     sessionId,
     contextSummary,
+    objectiveId,
+    objectiveGoal,
   );
 }
 
@@ -760,6 +927,8 @@ async function handleDirectAction(
   originalQuery = "",
   sessionId = null,
   contextSummary = "",
+  objectiveId = null,
+  objectiveGoal = "",
 ) {
   await routeViaAgent(
     sender,
@@ -769,6 +938,8 @@ async function handleDirectAction(
     originalQuery,
     sessionId,
     contextSummary,
+    objectiveId,
+    objectiveGoal,
   );
 }
 
@@ -776,15 +947,29 @@ async function handleDirectAction(
 // Confidence thresholds — conservative to avoid accidental shell execution
 const CONFIDENCE = { run_shell: 0.7, write_file: 0.75, read_file: 0.7 };
 
-async function routeMessage(sender, text, workspaceId, sessionId = null, contextSummary = "") {
-  // Classify intent via kernel action (uses Claude Haiku, falls back to heuristics)
-  // Pass session context so the classifier can resolve pronouns / topic references.
+async function routeMessage(
+  sender,
+  text,
+  workspaceId,
+  sessionId = null,
+  contextSummary = "",
+  objectiveId = null,
+  objectiveGoal = "",
+) {
+  // Build classify payload with session + objective context for pronoun resolution
+  const classifyPayload = { text };
+  const cogContext = [
+    objectiveGoal ? `Objective: ${objectiveGoal}` : "",
+    contextSummary ? `Session context: ${contextSummary}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  if (cogContext) {
+    classifyPayload.context_summary = cogContext;
+  }
+
   let classified = null;
   try {
-    const classifyPayload = { text };
-    if (contextSummary) {
-      classifyPayload.context_summary = contextSummary;
-    }
     const cls = await submitActionRequest(workspaceId, sender, "classify_intent", classifyPayload);
     if (cls.ok && cls.exec?.result) {
       classified = cls.exec.result;
@@ -795,6 +980,7 @@ async function routeMessage(sender, text, workspaceId, sessionId = null, context
           confidence: classified.confidence,
           mode: classified.mode,
           session_id: sessionId,
+          objective_id: objectiveId,
         },
         "classified",
       );
@@ -808,7 +994,16 @@ async function routeMessage(sender, text, workspaceId, sessionId = null, context
 
     if (action_type === "run_shell" && confidence >= CONFIDENCE.run_shell) {
       const command = params?.command ?? text;
-      await handleRun(sender, command, workspaceId, text, sessionId, contextSummary);
+      await handleRun(
+        sender,
+        command,
+        workspaceId,
+        text,
+        sessionId,
+        contextSummary,
+        objectiveId,
+        objectiveGoal,
+      );
       return;
     }
 
@@ -821,6 +1016,8 @@ async function routeMessage(sender, text, workspaceId, sessionId = null, context
         text,
         sessionId,
         contextSummary,
+        objectiveId,
+        objectiveGoal,
       );
       return;
     }
@@ -834,18 +1031,38 @@ async function routeMessage(sender, text, workspaceId, sessionId = null, context
         text,
         sessionId,
         contextSummary,
+        objectiveId,
+        objectiveGoal,
       );
       return;
     }
 
     // web_search, none, or below-threshold confidence → web_search fallback
     const query = params?.q ?? text;
-    await handleWebSearch(sender, query, workspaceId, text, sessionId, contextSummary);
+    await handleWebSearch(
+      sender,
+      query,
+      workspaceId,
+      text,
+      sessionId,
+      contextSummary,
+      objectiveId,
+      objectiveGoal,
+    );
     return;
   }
 
   // Classification unavailable — fall back to web_search
-  await handleWebSearch(sender, text, workspaceId, text, sessionId, contextSummary);
+  await handleWebSearch(
+    sender,
+    text,
+    workspaceId,
+    text,
+    sessionId,
+    contextSummary,
+    objectiveId,
+    objectiveGoal,
+  );
 }
 
 // ── Inbound webhook ───────────────────────────────────────────────────────────
@@ -962,8 +1179,35 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     app.log.warn({ err, sender }, "kernelResolveSession failed — continuing without session");
   }
 
+  // ── Resolve (or continue) cognitive objective ─────────────────────────────
+  // The objective pins the session to a concrete deliverable spec and enables
+  // follow-up binding, deliverable validation, and tool-truth enforcement.
+  let objectiveId = null;
+  let objectiveGoal = "";
+  if (sessionId) {
+    try {
+      const objRes = await kernelResolveObjective(wsId, sender, sessionId, text);
+      if (objRes.ok) {
+        objectiveId = objRes.objective_id ?? null;
+        objectiveGoal = objRes.goal ?? "";
+        app.log.info(
+          {
+            sender,
+            session_id: sessionId,
+            objective_id: objectiveId,
+            obj_decision: objRes.decision,
+            obj_reason: objRes.reason,
+          },
+          "objective resolved",
+        );
+      }
+    } catch (err) {
+      app.log.warn({ err, sender }, "kernelResolveObjective failed — continuing without objective");
+    }
+  }
+
   try {
-    await routeMessage(sender, text, wsId, sessionId, contextSummary);
+    await routeMessage(sender, text, wsId, sessionId, contextSummary, objectiveId, objectiveGoal);
   } catch (err) {
     app.log.error({ err, sender, wsId }, "routeMessage failed");
     await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
