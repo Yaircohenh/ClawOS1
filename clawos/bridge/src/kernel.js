@@ -105,3 +105,108 @@ export async function issueToken(workspaceId, toolName, actionRequestId, approva
 export async function kernelHealth() {
   return get("/kernel/health");
 }
+
+// ── Agent / Task / Subagent / DCT API ────────────────────────────────────────
+
+/**
+ * Register (or idempotently upsert) an AGENT.
+ * agent_id = sender's E.164/JID — the WhatsApp number IS the agent identity.
+ */
+export async function registerAgent(workspaceId, agentId, role = "orchestrator") {
+  return post("/kernel/agents", {
+    workspace_id: workspaceId,
+    agent_id: agentId,
+    role,
+  });
+}
+
+/**
+ * Create a contract-first task. Only AGENT may create tasks.
+ * contract: { objective, scope, deliverables, acceptance_checks }
+ * plan:     { steps, delegation_plan }  (optional)
+ */
+export async function kernelCreateTask(workspaceId, agentId, title, contract, plan = null) {
+  return post("/kernel/tasks", {
+    workspace_id: workspaceId,
+    created_by_agent_id: agentId,
+    title,
+    contract,
+    ...(plan ? { plan } : {}),
+  });
+}
+
+/**
+ * Spawn an ephemeral subagent under a task. Only AGENT may spawn subagents.
+ */
+export async function kernelSpawnSubagent(
+  workspaceId,
+  parentAgentId,
+  taskId,
+  workerType,
+  stepId = null,
+) {
+  return post("/kernel/subagents", {
+    workspace_id: workspaceId,
+    parent_agent_id: parentAgentId,
+    task_id: taskId,
+    worker_type: workerType,
+    ...(stepId ? { step_id: stepId } : {}),
+  });
+}
+
+/**
+ * Request a Delegation Capability Token (DCT) for an agent or subagent.
+ * Only AGENT may request tokens.
+ *
+ * Returns:
+ *   { ok: true, token, token_id, expires_at, risk_level }  — token minted
+ *   { ok: false, needs_approval: true, dar_id, risk_level } — approval required first
+ *   { ok: false, error: "scope_blocked_by_policy" }          — blocked
+ *
+ * @param {string} darId  — DCT approval request ID; provide on retry after approval
+ */
+export async function kernelRequestDCT(
+  workspaceId,
+  agentId,
+  issueTo,
+  scope,
+  taskId,
+  ttlSeconds = 600,
+  darId = null,
+) {
+  return post("/kernel/tokens/request", {
+    workspace_id: workspaceId,
+    requested_by_agent_id: agentId,
+    issue_to: issueTo, // { kind: "agent"|"subagent", id: "..." }
+    scope, // { allowed_tools[], operations[], resource_constraints{} }
+    task_id: taskId,
+    ttl_seconds: ttlSeconds,
+    ...(darId ? { dar_id: darId } : {}),
+  });
+}
+
+/**
+ * Grant a pending DCT approval request.
+ */
+export async function kernelGrantDCT(darId) {
+  return post(`/kernel/dct_approvals/${darId}/grant`, {});
+}
+
+/**
+ * Deny a pending DCT approval request.
+ */
+export async function kernelDenyDCT(darId) {
+  return post(`/kernel/dct_approvals/${darId}/deny`, {});
+}
+
+/**
+ * Execute a subagent worker with a DCT bearer token.
+ * Returns { ok: true, subagent_id, artifact_id, result }.
+ */
+export async function kernelRunSubagent(subagentId, workspaceId, token, input) {
+  return post(`/kernel/subagents/${subagentId}/run`, {
+    workspace_id: workspaceId,
+    token,
+    input,
+  });
+}

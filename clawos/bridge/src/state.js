@@ -61,6 +61,20 @@ export function removePendingApproval(approvalId) {
   persist("approvals.json", approvals);
 }
 
+// ── Agent registration (sender → boolean) ────────────────────────────────────
+// Tracks whether a sender has been registered as a kernel AGENT.
+// Avoids re-registering on every message (the kernel is idempotent, but it saves a round-trip).
+let agents = load("agents.json", {});
+
+export function isAgentRegistered(sender) {
+  return agents[sender] === true;
+}
+
+export function setAgentRegistered(sender) {
+  agents[sender] = true;
+  persist("agents.json", agents);
+}
+
 // ── Per-sender latest-pending state (drives yes/no/more/edit UX) ──────────────
 // Stored shape: {
 //   approval_id, action_type, payload, workspace_id,

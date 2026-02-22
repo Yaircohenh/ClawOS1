@@ -23,12 +23,20 @@ import {
   denyActionRequest,
   issueToken,
   kernelHealth,
+  registerAgent,
+  kernelCreateTask,
+  kernelSpawnSubagent,
+  kernelRequestDCT,
+  kernelGrantDCT,
+  kernelDenyDCT,
+  kernelRunSubagent,
 } from "./kernel.js";
 import { extractPdfText } from "./pdf.js";
 import {
   getWorkspaceId,
   saveWorkspaceId,
-  savePendingApproval,
+  isAgentRegistered,
+  setAgentRegistered,
   getPendingApproval,
   removePendingApproval,
   getSenderPending,
@@ -71,16 +79,26 @@ async function sendWhatsApp(to, text) {
   }
 }
 
-// ── Workspace helper ──────────────────────────────────────────────────────────
-async function ensureWorkspace(sender) {
+// ── Workspace + Agent bootstrap ───────────────────────────────────────────────
+// Creates workspace on first message and registers the sender as an AGENT.
+// The sender's E.164/JID IS their agent_id — the WhatsApp number is the identity.
+async function ensureAgent(sender) {
   let wsId = getWorkspaceId(sender);
   if (!wsId) {
     wsId = await createWorkspace();
     saveWorkspaceId(sender, wsId);
     app.log.info({ sender, wsId }, "created workspace");
   }
+  if (!isAgentRegistered(sender)) {
+    await registerAgent(wsId, sender, "orchestrator");
+    setAgentRegistered(sender);
+    app.log.info({ sender, wsId }, "registered agent");
+  }
   return wsId;
 }
+
+// Keep alias for callers that use the old name
+const ensureWorkspace = ensureAgent;
 
 // ── LLM-powered result prettifier ────────────────────────────────────────────
 // Calls interpret_result on the kernel to get a friendly WhatsApp-formatted
@@ -211,10 +229,187 @@ function buildMoreMessage(pending) {
   );
 }
 
-// ── Register a pending approval in both maps ───────────────────────────────────
-function registerPending(sender, approvalId, data) {
-  savePendingApproval(approvalId, data);
-  setSenderPending(sender, { ...data, approval_id: approvalId, editing: false });
+// ── Agent-architecture metadata ───────────────────────────────────────────────
+// Maps kernel action_type → worker_type, DCT scope, description, reversibility.
+const ACTION_META = {
+  run_shell: {
+    worker: "shell_executor",
+    scope: { allowed_tools: ["run_shell"], operations: ["execute"] },
+    description: "Run a shell command on the system",
+    reversible: false,
+  },
+  web_search: {
+    worker: "web_researcher",
+    scope: { allowed_tools: ["web_search"], operations: ["read"] },
+    description: "Search the web for information",
+    reversible: true,
+  },
+  write_file: {
+    worker: "file_writer",
+    scope: { allowed_tools: ["write_file"], operations: ["write"] },
+    description: "Write a file in the workspace",
+    reversible: true,
+  },
+  read_file: {
+    worker: "file_reader",
+    scope: { allowed_tools: ["read_file"], operations: ["read"] },
+    description: "Read a file in the workspace",
+    reversible: true,
+  },
+};
+
+/** Map action params to the shape the worker handler expects. */
+function buildWorkerInput(actionType, params) {
+  switch (actionType) {
+    case "run_shell":
+      return { command: params?.command ?? "" };
+    case "web_search":
+      return { query: params?.q ?? "" };
+    case "write_file":
+      return { path: params?.path ?? "", content: params?.content ?? "" };
+    case "read_file":
+      return { path: params?.path ?? "" };
+    default:
+      return params ?? {};
+  }
+}
+
+/**
+ * Core agent execution path — used for ALL user-facing actions.
+ *
+ * Flow:
+ *   AGENT creates TASK  →  spawns SUBAGENT  →  requests DCT
+ *   → if approval needed: store pending + ask user (yes/no/more/edit)
+ *   → if auto:            run subagent immediately → prettify → reply
+ */
+async function routeViaAgent(sender, workspaceId, actionType, params, originalQuery) {
+  const meta = ACTION_META[actionType] ?? ACTION_META.web_search;
+  const input = buildWorkerInput(actionType, params);
+  const title = `${actionType}: ${originalQuery?.slice(0, 60) ?? actionType}`;
+
+  // 1. Create contract-first task
+  let taskRes;
+  try {
+    taskRes = await kernelCreateTask(
+      workspaceId,
+      sender,
+      title,
+      {
+        objective: originalQuery ?? actionType,
+        scope: { tools: meta.scope.allowed_tools },
+        deliverables: ["result"],
+        acceptance_checks: [{ type: "min_artifacts", count: 1 }],
+      },
+      { steps: [{ id: "s1", worker_type: meta.worker }], delegation_plan: { s1: meta.worker } },
+    );
+  } catch (err) {
+    app.log.error({ err, sender }, "kernelCreateTask failed");
+    await sendWhatsApp(sender, `Bridge error: ${err.message}`);
+    return;
+  }
+  const taskId = taskRes.task_id;
+
+  // 2. Spawn subagent
+  let saRes;
+  try {
+    saRes = await kernelSpawnSubagent(workspaceId, sender, taskId, meta.worker, "s1");
+  } catch (err) {
+    app.log.error({ err, sender, taskId }, "kernelSpawnSubagent failed");
+    await sendWhatsApp(sender, `Bridge error: ${err.message}`);
+    return;
+  }
+  const subagentId = saRes.subagent_id;
+
+  // 3. Request Delegation Capability Token
+  let dctRes;
+  try {
+    dctRes = await kernelRequestDCT(
+      workspaceId,
+      sender,
+      { kind: "subagent", id: subagentId },
+      meta.scope,
+      taskId,
+      600,
+    );
+  } catch (err) {
+    app.log.error({ err, sender, subagentId }, "kernelRequestDCT failed");
+    await sendWhatsApp(sender, `Bridge error: ${err.message}`);
+    return;
+  }
+
+  // 3a. Blocked by policy
+  if (dctRes.error === "scope_blocked_by_policy") {
+    await sendWhatsApp(sender, `Action blocked by policy: ${dctRes.blocked_tool ?? actionType}`);
+    return;
+  }
+
+  // 3b. Approval required — store DCT pending and ask user
+  if (dctRes.needs_approval) {
+    const pendingData = {
+      pending_type: "dct_approval",
+      dar_id: dctRes.dar_id,
+      subagent_id: subagentId,
+      task_id: taskId,
+      workspace_id: workspaceId,
+      action_type: actionType,
+      payload: params, // kept for buildApprovalMessage / buildMoreMessage compat
+      scope: meta.scope,
+      original_query: originalQuery,
+      agent_id: sender,
+      risk_level: dctRes.risk_level,
+      description: meta.description,
+      reversible: meta.reversible,
+      editing: false,
+    };
+    setSenderPending(sender, pendingData);
+    await sendWhatsApp(sender, buildApprovalMessage(pendingData));
+    app.log.info({ sender, dar_id: dctRes.dar_id, actionType }, "dct_approval required");
+    return;
+  }
+
+  // 3c. Token minted immediately (auto policy)
+  await _executeSubagent(
+    sender,
+    workspaceId,
+    subagentId,
+    dctRes.token,
+    actionType,
+    input,
+    originalQuery,
+  );
+}
+
+/**
+ * Execute a subagent and send the prettified result to the user.
+ * Shared by the auto path and the post-approval path.
+ */
+async function _executeSubagent(
+  sender,
+  workspaceId,
+  subagentId,
+  token,
+  actionType,
+  input,
+  originalQuery,
+) {
+  let runRes;
+  try {
+    runRes = await kernelRunSubagent(subagentId, workspaceId, token, input);
+  } catch (err) {
+    app.log.error({ err, sender, subagentId }, "kernelRunSubagent failed");
+    await sendWhatsApp(sender, `Bridge error: ${err.message}`);
+    return;
+  }
+
+  if (runRes.ok) {
+    // result is the dispatch output from the worker; formatResult handles all known shapes
+    const raw = formatResult(runRes.result ?? runRes);
+    const friendly = await prettify(sender, workspaceId, actionType, raw, originalQuery ?? "");
+    await sendWhatsApp(sender, friendly);
+    app.log.info({ sender, subagent_id: subagentId, actionType }, "subagent executed");
+  } else {
+    await sendWhatsApp(sender, `Kernel error: ${runRes.error ?? JSON.stringify(runRes)}`);
+  }
 }
 
 // ── Clear a pending approval from both maps ────────────────────────────────────
@@ -293,6 +488,62 @@ async function handleDeny(sender, approvalId) {
   }
 }
 
+// ── DCT approval path (new agent architecture) ────────────────────────────────
+async function handleDCTApprove(sender, sp) {
+  try {
+    // 1. Grant the DCT approval request
+    await kernelGrantDCT(sp.dar_id);
+
+    // 2. Re-request DCT now that approval is granted
+    const dctRes = await kernelRequestDCT(
+      sp.workspace_id,
+      sender,
+      { kind: "subagent", id: sp.subagent_id },
+      sp.scope,
+      sp.task_id,
+      600,
+      sp.dar_id,
+    );
+
+    if (!dctRes.ok) {
+      await sendWhatsApp(sender, `Token request failed: ${dctRes.error ?? JSON.stringify(dctRes)}`);
+      return;
+    }
+
+    clearSenderPending(sender);
+
+    // 3. Run the subagent with the freshly minted DCT
+    const input = buildWorkerInput(sp.action_type, sp.payload);
+    await _executeSubagent(
+      sender,
+      sp.workspace_id,
+      sp.subagent_id,
+      dctRes.token,
+      sp.action_type,
+      input,
+      sp.original_query,
+    );
+    app.log.info(
+      { sender, dar_id: sp.dar_id, action_type: sp.action_type },
+      "dct approved and executed",
+    );
+  } catch (err) {
+    await sendWhatsApp(sender, `Approval error: ${err.message}`);
+    app.log.error({ err, sender }, "handleDCTApprove failed");
+  }
+}
+
+async function handleDCTDeny(sender, sp) {
+  try {
+    await kernelDenyDCT(sp.dar_id);
+    clearSenderPending(sender);
+    await sendWhatsApp(sender, "Cancelled.");
+    app.log.info({ sender, dar_id: sp.dar_id }, "dct denied");
+  } catch (err) {
+    await sendWhatsApp(sender, `Deny error: ${err.message}`);
+  }
+}
+
 // ── "yes" — approve sender's latest pending ───────────────────────────────────
 async function handleYes(sender) {
   const sp = getSenderPending(sender);
@@ -300,7 +551,12 @@ async function handleYes(sender) {
     await sendWhatsApp(sender, "No pending action to approve.");
     return;
   }
-  await handleApprove(sender, sp.approval_id);
+  if (sp.pending_type === "dct_approval") {
+    await handleDCTApprove(sender, sp);
+  } else {
+    // Legacy action-request approval path
+    await handleApprove(sender, sp.approval_id);
+  }
 }
 
 // ── "no" — deny sender's latest pending ──────────────────────────────────────
@@ -310,7 +566,12 @@ async function handleNo(sender) {
     await sendWhatsApp(sender, "No pending action to cancel.");
     return;
   }
-  await handleDeny(sender, sp.approval_id);
+  if (sp.pending_type === "dct_approval") {
+    await handleDCTDeny(sender, sp);
+  } else {
+    // Legacy action-request denial path
+    await handleDeny(sender, sp.approval_id);
+  }
 }
 
 // ── "more" — show detailed explanation of latest pending ─────────────────────
@@ -355,52 +616,26 @@ async function handleEditInput(sender, text, wsId) {
     return;
   }
 
-  // Cancel the old pending (orphan it in the kernel — it'll expire)
-  removePendingApproval(sp.approval_id);
+  // Discard the old pending.
+  // For DCT-pending: the old subagent/task stay in DB as orphaned (they'll never run).
+  // For legacy pending: orphan the action request.
+  if (sp.approval_id) {
+    removePendingApproval(sp.approval_id);
+  }
   clearSenderPending(sender);
 
   if (sp.action_type === "run_shell") {
-    // User edited a shell command — use the raw text as-is (no re-classification)
-    await handleRun(sender, text, wsId);
+    // Shell edit: use the new text as-is (no re-classification — user knows what they want)
+    await routeViaAgent(sender, wsId, "run_shell", { command: text }, text);
   } else {
-    // For all other types re-route through classify so the edited text is
-    // dispatched to the best action (user may have pivoted from search to a command)
+    // All other edits: re-classify (user may have pivoted intent)
     await routeMessage(sender, text, wsId);
   }
 }
 
-// ── !run <command> handler ────────────────────────────────────────────────────
+// ── Shell command handler — routes through agent architecture ─────────────────
 async function handleRun(sender, command, workspaceId, originalQuery = command) {
-  const result = await submitActionRequest(workspaceId, sender, "run_shell", { command });
-
-  if (result.approval_id) {
-    const { approval_id, action_request_id } = result;
-    const pendingData = {
-      sender,
-      workspace_id: workspaceId,
-      action_request_id,
-      action_type: "run_shell",
-      payload: { command },
-      agent_id: sender,
-      original_query: originalQuery,
-      risk_level: result.risk_level ?? "high",
-      reversible: result.reversible ?? false,
-      description: result.description ?? "Run a shell command on the system",
-    };
-    registerPending(sender, approval_id, pendingData);
-    await sendWhatsApp(sender, buildApprovalMessage(pendingData));
-    app.log.info({ sender, approval_id, command }, "run_shell approval required");
-    return;
-  }
-
-  if (result.ok) {
-    const raw = formatResult(result.exec);
-    const friendly = await prettify(sender, workspaceId, "run_shell", raw, originalQuery);
-    await sendWhatsApp(sender, friendly);
-    return;
-  }
-
-  await sendWhatsApp(sender, `Kernel error: ${result.error?.message ?? JSON.stringify(result)}`);
+  await routeViaAgent(sender, workspaceId, "run_shell", { command }, originalQuery);
 }
 
 // ── PDF / document handler ────────────────────────────────────────────────────
@@ -434,78 +669,14 @@ async function handleDocument(sender, msg, workspaceId) {
   await sendWhatsApp(sender, `Kernel error: ${result.error ?? JSON.stringify(result)}`);
 }
 
-// ── Web search handler (direct, no classification) ────────────────────────────
+// ── Web search handler — routes through agent architecture ────────────────────
 async function handleWebSearch(sender, query, workspaceId, originalQuery = query) {
-  const result = await submitActionRequest(workspaceId, sender, "web_search", { q: query });
-
-  if (result.approval_id) {
-    const { approval_id, action_request_id } = result;
-    const pendingData = {
-      sender,
-      workspace_id: workspaceId,
-      action_request_id,
-      action_type: "web_search",
-      payload: { q: query },
-      agent_id: sender,
-      original_query: originalQuery,
-      risk_level: result.risk_level ?? "low",
-      reversible: result.reversible ?? true,
-      description: result.description ?? "Search the web for information",
-    };
-    registerPending(sender, approval_id, pendingData);
-    await sendWhatsApp(sender, buildApprovalMessage(pendingData));
-    app.log.info({ sender, approval_id }, "web_search approval required");
-    return;
-  }
-
-  if (result.ok) {
-    const raw = formatResult(result.exec);
-    const friendly = await prettify(sender, workspaceId, "web_search", raw, originalQuery);
-    await sendWhatsApp(sender, friendly);
-    return;
-  }
-
-  await sendWhatsApp(
-    sender,
-    `Kernel error: ${result.error?.message ?? JSON.stringify(result.error ?? result)}`,
-  );
+  await routeViaAgent(sender, workspaceId, "web_search", { q: query }, originalQuery);
 }
 
-// ── Generic action handler (write_file, read_file, etc.) ─────────────────────
+// ── Generic action handler — routes through agent architecture ────────────────
 async function handleDirectAction(sender, actionType, params, workspaceId, originalQuery = "") {
-  const result = await submitActionRequest(workspaceId, sender, actionType, params);
-
-  if (result.approval_id) {
-    const { approval_id, action_request_id } = result;
-    const pendingData = {
-      sender,
-      workspace_id: workspaceId,
-      action_request_id,
-      action_type: actionType,
-      payload: params,
-      agent_id: sender,
-      original_query: originalQuery,
-      risk_level: result.risk_level ?? "medium",
-      reversible: result.reversible ?? true,
-      description: result.description ?? actionType,
-    };
-    registerPending(sender, approval_id, pendingData);
-    await sendWhatsApp(sender, buildApprovalMessage(pendingData));
-    app.log.info({ sender, approval_id, actionType }, "action approval required");
-    return;
-  }
-
-  if (result.ok) {
-    const raw = formatResult(result.exec ?? result);
-    const friendly = await prettify(sender, workspaceId, actionType, raw, originalQuery);
-    await sendWhatsApp(sender, friendly);
-    return;
-  }
-
-  await sendWhatsApp(
-    sender,
-    `Kernel error: ${result.error?.message ?? JSON.stringify(result.error ?? result)}`,
-  );
+  await routeViaAgent(sender, workspaceId, actionType, params, originalQuery);
 }
 
 // ── NL Router: classify → dispatch ───────────────────────────────────────────
