@@ -20,6 +20,7 @@ import {
   issueToken,
   kernelHealth,
 } from "./kernel.js";
+import { extractPdfText } from "./pdf.js";
 import {
   getWorkspaceId,
   saveWorkspaceId,
@@ -90,6 +91,17 @@ function formatResult(exec) {
   if (inner.output !== undefined) {
     const prefix = inner.ok === false ? "Exit " + inner.exit_code + "\n" : "";
     return prefix + inner.output;
+  }
+
+  // Document summary (Anthropic)
+  if (inner.mode === "anthropic" && inner.summary) {
+    return `*${inner.filename}* (${inner.page_count}p)\n\n${inner.summary}`;
+  }
+
+  // Document excerpt fallback
+  if (inner.mode === "excerpt") {
+    const note = inner.note ? `\n\n_${inner.note}_` : "";
+    return `*${inner.filename}* (${inner.page_count}p) — first 3000 chars:\n\n${inner.excerpt}${note}`;
   }
 
   return (
@@ -195,6 +207,37 @@ async function handleRun(sender, command, workspaceId) {
   await sendWhatsApp(sender, `Kernel error: ${result.error?.message ?? JSON.stringify(result)}`);
 }
 
+// ── PDF / document handler ────────────────────────────────────────────────────
+async function handleDocument(sender, msg, workspaceId) {
+  const mediaPath = msg.mediaPath;
+  const filename = String(msg.filename ?? msg.mediaPath ?? "document.pdf")
+    .split("/")
+    .pop();
+
+  await sendWhatsApp(sender, `Reading ${filename}…`);
+
+  let text, pageCount;
+  try {
+    ({ text, pageCount } = await extractPdfText(mediaPath));
+  } catch (err) {
+    await sendWhatsApp(sender, `Could not read PDF: ${err.message}`);
+    return;
+  }
+
+  const result = await submitActionRequest(workspaceId, sender, "summarize_document", {
+    text,
+    page_count: pageCount,
+    filename,
+  });
+
+  if (result.ok) {
+    await sendWhatsApp(sender, formatResult(result.exec ?? result));
+    return;
+  }
+
+  await sendWhatsApp(sender, `Kernel error: ${result.error ?? JSON.stringify(result)}`);
+}
+
 // ── Normal message handler (web_search) ───────────────────────────────────────
 async function handleMessage(sender, text, workspaceId) {
   const result = await submitActionRequest(workspaceId, sender, "web_search", { q: text });
@@ -232,15 +275,36 @@ async function handleMessage(sender, text, workspaceId) {
 app.post("/webhook/whatsapp", async (req, reply) => {
   const msg = req.body ?? {};
   const text = String(msg.body ?? "").trim();
+  const mediaPath = msg.mediaPath ? String(msg.mediaPath) : null;
 
   // DMs: prefer E.164; Groups: use senderJid; fallback to `from`.
   const sender = msg.senderE164 ?? msg.senderJid ?? msg.from;
 
-  if (!text || !sender) {
+  // A PDF message may have no body text — allow it through if mediaPath is set
+  if ((!text && !mediaPath) || !sender) {
     return reply.code(400).send({ error: "empty body or missing sender" });
   }
 
-  app.log.info({ sender, chatType: msg.chatType, bodyLen: text.length }, "inbound");
+  app.log.info(
+    { sender, chatType: msg.chatType, bodyLen: text.length, hasMedia: Boolean(mediaPath) },
+    "inbound",
+  );
+
+  // ── PDF / document ────────────────────────────────────────────────────────
+  if (mediaPath && (mediaPath.endsWith(".pdf") || String(msg.mimeType ?? "").includes("pdf"))) {
+    let wsId;
+    try {
+      wsId = await ensureWorkspace(sender);
+    } catch (err) {
+      await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
+      return reply.code(500).send({ error: "workspace_error" });
+    }
+    await handleDocument(sender, msg, wsId).catch((err) => {
+      app.log.error({ err, sender, mediaPath }, "handleDocument failed");
+      sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
+    });
+    return { ok: true };
+  }
 
   // ── !approve <id> ─────────────────────────────────────────────────────────
   if (text.startsWith("!approve ")) {

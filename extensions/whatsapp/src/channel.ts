@@ -498,7 +498,16 @@ function buildBridgeMessageSink(): {
       // The agent seeing "!approve ap_xxx" in its context would cause it to
       // autonomously re-send the approval, creating a self-approval loop.
       const body = String(msg.body ?? "");
-      return body.startsWith("!run ") || body.startsWith("!approve ") || body.startsWith("!deny ");
+      if (body.startsWith("!run ") || body.startsWith("!approve ") || body.startsWith("!deny ")) {
+        return true;
+      }
+
+      // Consume PDF/document messages — the bridge handles them directly;
+      // the Claude agent should not also process the raw binary attachment.
+      const mediaPath = String(msg.mediaPath ?? "");
+      if (mediaPath && (mediaPath.endsWith(".pdf") || String(msg.mimeType ?? "").includes("pdf"))) {
+        return true;
+      }
     },
   };
 }
