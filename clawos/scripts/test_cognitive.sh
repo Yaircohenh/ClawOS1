@@ -171,6 +171,11 @@ check_contains "sanitized contains Unknown" "Unknown" "$SANITIZED"
 check_contains "sanitized contains disclaimer" "not verified" "$SANITIZED"
 echo "  sanitized preview: ${SANITIZED:0:100}..."
 
+# Complete OBJ_NOEV so it no longer interferes with follow-up binding in test 8
+curl -s -X PATCH "$KERNEL/kernel/objectives/$OBJ_NOEV_ID" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"completed","result_summary":"test helper — completed"}' > /dev/null
+
 # ── 6. Deliverable validation: 10-item list → pass ────────────────────────────
 echo
 echo "--- 6. Deliverable validation: 10 items → pass ---"

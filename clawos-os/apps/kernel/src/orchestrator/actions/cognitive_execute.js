@@ -132,7 +132,9 @@ async function extractObjective(db, { text }) {
     };
   } catch {
     // Heuristic fallback: detect list request
-    const countMatch = text.match(/\b(\d+)\s+(?:names?|ideas?|suggestions?|items?|results?|options?)/i);
+    // Allow up to 3 modifier words between the count and the list noun:
+    //   "5 ideas" | "5 Python code examples" | "10 great AI OS names"
+    const countMatch = text.match(/\b(\d+)(?:\s+\w+){0,3}\s+(?:names?|ideas?|suggestions?|items?|results?|options?|examples?|steps?|ways?|tips?|points?|things?|reasons?|facts?)\b/i);
     const count = countMatch ? parseInt(countMatch[1], 10) : null;
     const isListRequest = count !== null || /\b(list|give me|come up with|suggest|find me)\b/i.test(text);
     return {
