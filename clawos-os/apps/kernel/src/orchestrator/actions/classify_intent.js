@@ -171,12 +171,20 @@ export const action = {
       throw new Error("payload.text (string) is required");
     }
 
+    // Optional session context — passed by bridge when a session is active.
+    // Prepended to the user message so the LLM can disambiguate pronouns and
+    // references that only make sense with prior context.
+    const contextSummary = req.payload?.context_summary;
+    const fullText = contextSummary
+      ? `Session context:\n${contextSummary}\n\nUser message: ${text}`
+      : text;
+
     if (ctx?.db) {
       // Try xAI (Grok) first — OpenAI-compatible, preferred when configured
       const xai = getSecret(ctx.db, "xai");
       if (xai?.api_key) {
         try {
-          return await classifyWithXai(text, xai.api_key);
+          return await classifyWithXai(fullText, xai.api_key);
         } catch {
           // Fall through to Anthropic
         }
@@ -186,13 +194,13 @@ export const action = {
       const anthropic = getSecret(ctx.db, "anthropic");
       if (anthropic?.api_key) {
         try {
-          return await classifyWithAnthropic(text, anthropic.api_key);
+          return await classifyWithAnthropic(fullText, anthropic.api_key);
         } catch {
           // Fall through to heuristics
         }
       }
     }
 
-    return classifyWithHeuristics(text);
+    return classifyWithHeuristics(text); // heuristics always use raw text (no context)
   },
 };
