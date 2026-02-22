@@ -75,6 +75,16 @@ export function setAgentRegistered(sender) {
   persist("agents.json", agents);
 }
 
+export function clearAgentRegistered(sender) {
+  delete agents[sender];
+  persist("agents.json", agents);
+}
+
+export function clearWorkspaceId(sender) {
+  delete workspaces[sender];
+  persist("workspaces.json", workspaces);
+}
+
 // ── Per-sender latest-pending state (drives yes/no/more/edit UX) ──────────────
 // Stored shape: {
 //   approval_id, action_type, payload, workspace_id,

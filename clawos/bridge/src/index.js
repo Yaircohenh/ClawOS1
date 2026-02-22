@@ -42,8 +42,10 @@ import { extractPdfText } from "./pdf.js";
 import {
   getWorkspaceId,
   saveWorkspaceId,
+  clearWorkspaceId,
   isAgentRegistered,
   setAgentRegistered,
+  clearAgentRegistered,
   getPendingApproval,
   removePendingApproval,
   getSenderPending,
@@ -101,6 +103,19 @@ async function ensureAgent(sender) {
     setAgentRegistered(sender);
     app.log.info({ sender, wsId }, "registered agent");
   }
+  return wsId;
+}
+
+// Reset stale workspace state and re-bootstrap (called on workspace_not_found).
+async function resetAndEnsureAgent(sender) {
+  app.log.warn({ sender }, "stale workspace — resetting and recreating");
+  clearWorkspaceId(sender);
+  clearAgentRegistered(sender);
+  const wsId = await createWorkspace();
+  saveWorkspaceId(sender, wsId);
+  await registerAgent(wsId, sender, "orchestrator");
+  setAgentRegistered(sender);
+  app.log.info({ sender, wsId }, "recreated workspace + agent");
   return wsId;
 }
 
@@ -1153,9 +1168,20 @@ app.post("/webhook/whatsapp", async (req, reply) => {
   try {
     wsId = await ensureWorkspace(sender);
   } catch (err) {
-    app.log.error({ err, sender }, "ensureWorkspace failed");
-    await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
-    return reply.code(500).send({ error: "workspace_error" });
+    // workspace_not_found / agent_not_found → kernel DB was reset; retry once
+    if (err.message?.includes("workspace_not_found") || err.message?.includes("agent_not_found")) {
+      try {
+        wsId = await resetAndEnsureAgent(sender);
+      } catch (retryErr) {
+        app.log.error({ retryErr, sender }, "ensureWorkspace retry failed");
+        await sendWhatsApp(sender, `Bridge error: ${retryErr.message}`).catch(() => {});
+        return reply.code(500).send({ error: "workspace_error" });
+      }
+    } else {
+      app.log.error({ err, sender }, "ensureWorkspace failed");
+      await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
+      return reply.code(500).send({ error: "workspace_error" });
+    }
   }
 
   // ── Resolve (or create) session for this sender ───────────────────────────
