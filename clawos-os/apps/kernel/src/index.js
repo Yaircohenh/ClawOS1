@@ -234,6 +234,19 @@ const PROVIDERS = {
       return true;
     },
   },
+  xai: {
+    label: "xAI (Grok)",
+    fields: ["api_key"],
+    mask: (s) => ({ api_key: maskStr(s.api_key, 7, 4) }),
+    test: async (s) => {
+      if (!s.api_key) {throw new Error("api_key is required");}
+      const r = await fetch("https://api.x.ai/v1/models", {
+        headers: { "Authorization": `Bearer ${s.api_key}` },
+      });
+      if (!r.ok) {throw new Error(`xAI API returned HTTP ${r.status}`);}
+      return true;
+    },
+  },
   smtp: {
     label: "SMTP",
     fields: ["host", "port", "user", "password"],

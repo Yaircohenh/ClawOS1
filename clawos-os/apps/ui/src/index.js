@@ -124,7 +124,7 @@ const FIELD_LABELS = {
   user: "Username / Email", password: "Password",
 };
 const PROVIDER_ICONS = {
-  brave: "🦁", openai: "⬡", anthropic: "⚡", smtp: "✉",
+  brave: "🦁", openai: "⬡", anthropic: "⚡", xai: "𝕏", smtp: "✉",
 };
 
 async function api(method, path, body) {

@@ -13,7 +13,8 @@
  */
 import { getSecret } from "../connections.js";
 
-const MODEL = "claude-haiku-4-5-20251001";
+const ANTHROPIC_MODEL = "claude-haiku-4-5-20251001";
+const XAI_MODEL = "grok-3-mini";
 
 const SYSTEM_PROMPT = `You are a command router for a personal AI assistant.
 Classify the user message into one of these actions and produce the right parameters.
@@ -41,8 +42,48 @@ RULES
 Respond with ONLY a JSON object — no markdown, no explanation:
 {"action_type":"...","params":{...},"confidence":0.9,"reasoning":"one sentence"}`;
 
-// ── Anthropic-powered classifier ───────────────────────────────────────────────
-async function classifyWithLLM(text, apiKey) {
+// ── Shared JSON parser (handles accidental markdown fences) ───────────────────
+function parseClassifyResponse(raw) {
+  const jsonStr = raw.replace(/^```(?:json)?/m, "").replace(/```$/m, "").trim();
+  const parsed = JSON.parse(jsonStr);
+  return {
+    action_type: String(parsed.action_type ?? "web_search"),
+    params: parsed.params ?? {},
+    confidence: Number(parsed.confidence ?? 0.5),
+    reasoning: String(parsed.reasoning ?? ""),
+  };
+}
+
+// ── xAI (Grok) classifier — OpenAI-compatible API ────────────────────────────
+async function classifyWithXai(text, apiKey) {
+  const r = await fetch("https://api.x.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: XAI_MODEL,
+      max_tokens: 256,
+      temperature: 0,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: text },
+      ],
+    }),
+  });
+
+  if (!r.ok) {
+    throw new Error(`xAI returned HTTP ${r.status}`);
+  }
+
+  const data = await r.json();
+  const raw = data.choices?.[0]?.message?.content ?? "";
+  return { ...parseClassifyResponse(raw), mode: "llm", provider: "xai" };
+}
+
+// ── Anthropic (Claude Haiku) classifier ───────────────────────────────────────
+async function classifyWithAnthropic(text, apiKey) {
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -51,7 +92,7 @@ async function classifyWithLLM(text, apiKey) {
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: MODEL,
+      model: ANTHROPIC_MODEL,
       max_tokens: 256,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: text }],
@@ -64,18 +105,7 @@ async function classifyWithLLM(text, apiKey) {
 
   const data = await r.json();
   const raw = data.content?.[0]?.text ?? "";
-
-  // Strip accidental markdown fences
-  const jsonStr = raw.replace(/^```(?:json)?/m, "").replace(/```$/m, "").trim();
-  const parsed = JSON.parse(jsonStr);
-
-  return {
-    action_type: String(parsed.action_type ?? "web_search"),
-    params: parsed.params ?? {},
-    confidence: Number(parsed.confidence ?? 0.5),
-    reasoning: String(parsed.reasoning ?? ""),
-    mode: "llm",
-  };
+  return { ...parseClassifyResponse(raw), mode: "llm", provider: "anthropic" };
 }
 
 // ── Keyword heuristic fallback ─────────────────────────────────────────────────
@@ -141,14 +171,24 @@ export const action = {
       throw new Error("payload.text (string) is required");
     }
 
-    // Try Anthropic LLM first
     if (ctx?.db) {
+      // Try xAI (Grok) first — OpenAI-compatible, preferred when configured
+      const xai = getSecret(ctx.db, "xai");
+      if (xai?.api_key) {
+        try {
+          return await classifyWithXai(text, xai.api_key);
+        } catch {
+          // Fall through to Anthropic
+        }
+      }
+
+      // Try Anthropic (Claude Haiku) second
       const anthropic = getSecret(ctx.db, "anthropic");
       if (anthropic?.api_key) {
         try {
-          return await classifyWithLLM(text, anthropic.api_key);
+          return await classifyWithAnthropic(text, anthropic.api_key);
         } catch {
-          // Fall through to heuristics on any error
+          // Fall through to heuristics
         }
       }
     }
