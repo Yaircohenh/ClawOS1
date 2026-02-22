@@ -20,6 +20,19 @@ async function post(path, body) {
   return json;
 }
 
+async function patch(path, body) {
+  const res = await fetch(`${KERNEL_URL}${path}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Kernel PATCH ${path} → ${res.status}: ${JSON.stringify(json)}`);
+  }
+  return json;
+}
+
 async function get(path) {
   const res = await fetch(`${KERNEL_URL}${path}`);
   const json = await res.json().catch(() => ({}));
@@ -197,6 +210,55 @@ export async function kernelGrantDCT(darId) {
  */
 export async function kernelDenyDCT(darId) {
   return post(`/kernel/dct_approvals/${darId}/deny`, {});
+}
+
+// ── Session API ───────────────────────────────────────────────────────────────
+
+/**
+ * Resolve (or create) a session for an inbound message.
+ *
+ * Returns:
+ *   { ok: true, session_id, decision: "continue"|"new", reason, session: { context_summary, ... } }
+ *
+ * @param {string} workspaceId
+ * @param {string} channel        e.g. "whatsapp"
+ * @param {string} remoteJid      sender E.164 / JID
+ * @param {string} userMessage    the raw inbound text (used for reset detection + drift)
+ */
+export async function kernelResolveSession(workspaceId, channel, remoteJid, userMessage) {
+  return post("/kernel/sessions/resolve", {
+    workspace_id: workspaceId,
+    channel,
+    remote_jid: remoteJid,
+    user_message: userMessage,
+  });
+}
+
+/**
+ * Advance a session after a turn: increments turn_count, updates last_message_at,
+ * and triggers context_summary regeneration in the kernel.
+ *
+ * Non-fatal if the call fails — the bridge logs a warning and continues.
+ *
+ * @param {string} sessionId
+ * @param {string} workspaceId
+ * @param {string} userMessage
+ * @param {string} assistantResponse  prettified text that was sent to the user
+ * @param {string} actionType         e.g. "web_search"
+ */
+export async function kernelUpdateSession(
+  sessionId,
+  workspaceId,
+  userMessage,
+  assistantResponse,
+  actionType,
+) {
+  return patch(`/kernel/sessions/${sessionId}`, {
+    workspace_id: workspaceId,
+    user_message: userMessage,
+    assistant_response: assistantResponse,
+    action_type: actionType,
+  });
 }
 
 /**

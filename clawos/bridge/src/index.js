@@ -30,6 +30,8 @@ import {
   kernelGrantDCT,
   kernelDenyDCT,
   kernelRunSubagent,
+  kernelResolveSession,
+  kernelUpdateSession,
 } from "./kernel.js";
 import { extractPdfText } from "./pdf.js";
 import {
@@ -282,10 +284,23 @@ function buildWorkerInput(actionType, params) {
  *   → if approval needed: store pending + ask user (yes/no/more/edit)
  *   → if auto:            run subagent immediately → prettify → reply
  */
-async function routeViaAgent(sender, workspaceId, actionType, params, originalQuery) {
+async function routeViaAgent(
+  sender,
+  workspaceId,
+  actionType,
+  params,
+  originalQuery,
+  sessionId = null,
+  contextSummary = "",
+) {
   const meta = ACTION_META[actionType] ?? ACTION_META.web_search;
   const input = buildWorkerInput(actionType, params);
   const title = `${actionType}: ${originalQuery?.slice(0, 60) ?? actionType}`;
+
+  // Build task objective — include session context so the worker has prior turn info
+  const objective = contextSummary
+    ? `${originalQuery ?? actionType}\n\n--- Session context ---\n${contextSummary}`
+    : (originalQuery ?? actionType);
 
   // 1. Create contract-first task
   let taskRes;
@@ -295,7 +310,7 @@ async function routeViaAgent(sender, workspaceId, actionType, params, originalQu
       sender,
       title,
       {
-        objective: originalQuery ?? actionType,
+        objective,
         scope: { tools: meta.scope.allowed_tools },
         deliverables: ["result"],
         acceptance_checks: [{ type: "min_artifacts", count: 1 }],
@@ -360,10 +375,16 @@ async function routeViaAgent(sender, workspaceId, actionType, params, originalQu
       description: meta.description,
       reversible: meta.reversible,
       editing: false,
+      // Session context — preserved through the approval round-trip
+      session_id: sessionId,
+      context_summary: contextSummary,
     };
     setSenderPending(sender, pendingData);
     await sendWhatsApp(sender, buildApprovalMessage(pendingData));
-    app.log.info({ sender, dar_id: dctRes.dar_id, actionType }, "dct_approval required");
+    app.log.info(
+      { sender, dar_id: dctRes.dar_id, actionType, session_id: sessionId },
+      "dct_approval required",
+    );
     return;
   }
 
@@ -376,6 +397,7 @@ async function routeViaAgent(sender, workspaceId, actionType, params, originalQu
     actionType,
     input,
     originalQuery,
+    sessionId,
   );
 }
 
@@ -391,6 +413,7 @@ async function _executeSubagent(
   actionType,
   input,
   originalQuery,
+  sessionId = null,
 ) {
   let runRes;
   try {
@@ -406,7 +429,18 @@ async function _executeSubagent(
     const raw = formatResult(runRes.result ?? runRes);
     const friendly = await prettify(sender, workspaceId, actionType, raw, originalQuery ?? "");
     await sendWhatsApp(sender, friendly);
-    app.log.info({ sender, subagent_id: subagentId, actionType }, "subagent executed");
+    app.log.info(
+      { sender, subagent_id: subagentId, actionType, session_id: sessionId },
+      "subagent executed",
+    );
+
+    // Advance session context — non-fatal, fire-and-forget
+    if (sessionId) {
+      kernelUpdateSession(sessionId, workspaceId, originalQuery ?? "", friendly, actionType).catch(
+        (err) =>
+          app.log.warn({ err, session_id: sessionId }, "session context update failed — non-fatal"),
+      );
+    }
   } else {
     await sendWhatsApp(sender, `Kernel error: ${runRes.error ?? JSON.stringify(runRes)}`);
   }
@@ -522,9 +556,10 @@ async function handleDCTApprove(sender, sp) {
       sp.action_type,
       input,
       sp.original_query,
+      sp.session_id ?? null,
     );
     app.log.info(
-      { sender, dar_id: sp.dar_id, action_type: sp.action_type },
+      { sender, dar_id: sp.dar_id, action_type: sp.action_type, session_id: sp.session_id ?? null },
       "dct approved and executed",
     );
   } catch (err) {
@@ -611,10 +646,14 @@ async function handleEdit(sender) {
 async function handleEditInput(sender, text, wsId) {
   const sp = getSenderPending(sender);
   if (!sp) {
-    // Editing state expired — treat as new message
+    // Editing state expired — treat as new message (no session context available)
     await routeMessage(sender, text, wsId);
     return;
   }
+
+  // Preserve session context through the edit round-trip
+  const sessionId = sp.session_id ?? null;
+  const contextSummary = sp.context_summary ?? "";
 
   // Discard the old pending.
   // For DCT-pending: the old subagent/task stay in DB as orphaned (they'll never run).
@@ -626,16 +665,39 @@ async function handleEditInput(sender, text, wsId) {
 
   if (sp.action_type === "run_shell") {
     // Shell edit: use the new text as-is (no re-classification — user knows what they want)
-    await routeViaAgent(sender, wsId, "run_shell", { command: text }, text);
+    await routeViaAgent(
+      sender,
+      wsId,
+      "run_shell",
+      { command: text },
+      text,
+      sessionId,
+      contextSummary,
+    );
   } else {
     // All other edits: re-classify (user may have pivoted intent)
-    await routeMessage(sender, text, wsId);
+    await routeMessage(sender, text, wsId, sessionId, contextSummary);
   }
 }
 
 // ── Shell command handler — routes through agent architecture ─────────────────
-async function handleRun(sender, command, workspaceId, originalQuery = command) {
-  await routeViaAgent(sender, workspaceId, "run_shell", { command }, originalQuery);
+async function handleRun(
+  sender,
+  command,
+  workspaceId,
+  originalQuery = command,
+  sessionId = null,
+  contextSummary = "",
+) {
+  await routeViaAgent(
+    sender,
+    workspaceId,
+    "run_shell",
+    { command },
+    originalQuery,
+    sessionId,
+    contextSummary,
+  );
 }
 
 // ── PDF / document handler ────────────────────────────────────────────────────
@@ -670,24 +732,60 @@ async function handleDocument(sender, msg, workspaceId) {
 }
 
 // ── Web search handler — routes through agent architecture ────────────────────
-async function handleWebSearch(sender, query, workspaceId, originalQuery = query) {
-  await routeViaAgent(sender, workspaceId, "web_search", { q: query }, originalQuery);
+async function handleWebSearch(
+  sender,
+  query,
+  workspaceId,
+  originalQuery = query,
+  sessionId = null,
+  contextSummary = "",
+) {
+  await routeViaAgent(
+    sender,
+    workspaceId,
+    "web_search",
+    { q: query },
+    originalQuery,
+    sessionId,
+    contextSummary,
+  );
 }
 
 // ── Generic action handler — routes through agent architecture ────────────────
-async function handleDirectAction(sender, actionType, params, workspaceId, originalQuery = "") {
-  await routeViaAgent(sender, workspaceId, actionType, params, originalQuery);
+async function handleDirectAction(
+  sender,
+  actionType,
+  params,
+  workspaceId,
+  originalQuery = "",
+  sessionId = null,
+  contextSummary = "",
+) {
+  await routeViaAgent(
+    sender,
+    workspaceId,
+    actionType,
+    params,
+    originalQuery,
+    sessionId,
+    contextSummary,
+  );
 }
 
 // ── NL Router: classify → dispatch ───────────────────────────────────────────
 // Confidence thresholds — conservative to avoid accidental shell execution
 const CONFIDENCE = { run_shell: 0.7, write_file: 0.75, read_file: 0.7 };
 
-async function routeMessage(sender, text, workspaceId) {
+async function routeMessage(sender, text, workspaceId, sessionId = null, contextSummary = "") {
   // Classify intent via kernel action (uses Claude Haiku, falls back to heuristics)
+  // Pass session context so the classifier can resolve pronouns / topic references.
   let classified = null;
   try {
-    const cls = await submitActionRequest(workspaceId, sender, "classify_intent", { text });
+    const classifyPayload = { text };
+    if (contextSummary) {
+      classifyPayload.context_summary = contextSummary;
+    }
+    const cls = await submitActionRequest(workspaceId, sender, "classify_intent", classifyPayload);
     if (cls.ok && cls.exec?.result) {
       classified = cls.exec.result;
       app.log.info(
@@ -696,6 +794,7 @@ async function routeMessage(sender, text, workspaceId) {
           action_type: classified.action_type,
           confidence: classified.confidence,
           mode: classified.mode,
+          session_id: sessionId,
         },
         "classified",
       );
@@ -709,28 +808,44 @@ async function routeMessage(sender, text, workspaceId) {
 
     if (action_type === "run_shell" && confidence >= CONFIDENCE.run_shell) {
       const command = params?.command ?? text;
-      await handleRun(sender, command, workspaceId, text);
+      await handleRun(sender, command, workspaceId, text, sessionId, contextSummary);
       return;
     }
 
     if (action_type === "write_file" && confidence >= CONFIDENCE.write_file) {
-      await handleDirectAction(sender, "write_file", params, workspaceId, text);
+      await handleDirectAction(
+        sender,
+        "write_file",
+        params,
+        workspaceId,
+        text,
+        sessionId,
+        contextSummary,
+      );
       return;
     }
 
     if (action_type === "read_file" && confidence >= CONFIDENCE.read_file) {
-      await handleDirectAction(sender, "read_file", params, workspaceId, text);
+      await handleDirectAction(
+        sender,
+        "read_file",
+        params,
+        workspaceId,
+        text,
+        sessionId,
+        contextSummary,
+      );
       return;
     }
 
     // web_search, none, or below-threshold confidence → web_search fallback
     const query = params?.q ?? text;
-    await handleWebSearch(sender, query, workspaceId, text);
+    await handleWebSearch(sender, query, workspaceId, text, sessionId, contextSummary);
     return;
   }
 
   // Classification unavailable — fall back to web_search
-  await handleWebSearch(sender, text, workspaceId, text);
+  await handleWebSearch(sender, text, workspaceId, text, sessionId, contextSummary);
 }
 
 // ── Inbound webhook ───────────────────────────────────────────────────────────
@@ -826,8 +941,29 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     return reply.code(500).send({ error: "workspace_error" });
   }
 
+  // ── Resolve (or create) session for this sender ───────────────────────────
+  let sessionId = null;
+  let contextSummary = "";
   try {
-    await routeMessage(sender, text, wsId);
+    const sessionRes = await kernelResolveSession(wsId, "whatsapp", sender, text);
+    sessionId = sessionRes.session_id ?? null;
+    contextSummary = sessionRes.session?.context_summary ?? "";
+    app.log.info(
+      { sender, session_id: sessionId, decision: sessionRes.decision, reason: sessionRes.reason },
+      "session resolved",
+    );
+    // Explicit reset: acknowledge, clear any stale pending, skip normal routing
+    if (sessionRes.decision === "new" && sessionRes.reason === "explicit_reset") {
+      clearSenderPending(sender);
+      await sendWhatsApp(sender, "Starting fresh. How can I help you?");
+      return { ok: true };
+    }
+  } catch (err) {
+    app.log.warn({ err, sender }, "kernelResolveSession failed — continuing without session");
+  }
+
+  try {
+    await routeMessage(sender, text, wsId, sessionId, contextSummary);
   } catch (err) {
     app.log.error({ err, sender, wsId }, "routeMessage failed");
     await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
