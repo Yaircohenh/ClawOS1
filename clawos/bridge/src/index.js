@@ -1164,80 +1164,95 @@ app.post("/webhook/whatsapp", async (req, reply) => {
   }
 
   // ── Route message through intent classifier ───────────────────────────────
-  let wsId;
-  try {
-    wsId = await ensureWorkspace(sender);
-  } catch (err) {
-    // workspace_not_found / agent_not_found → kernel DB was reset; retry once
-    if (err.message?.includes("workspace_not_found") || err.message?.includes("agent_not_found")) {
-      try {
-        wsId = await resetAndEnsureAgent(sender);
-      } catch (retryErr) {
-        app.log.error({ retryErr, sender }, "ensureWorkspace retry failed");
-        await sendWhatsApp(sender, `Bridge error: ${retryErr.message}`).catch(() => {});
-        return reply.code(500).send({ error: "workspace_error" });
-      }
-    } else {
-      app.log.error({ err, sender }, "ensureWorkspace failed");
-      await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
-      return reply.code(500).send({ error: "workspace_error" });
-    }
-  }
+  // Wrapped in a one-shot retry: if any kernel call returns workspace_not_found
+  // the stale workspace is cleared and the whole routing block runs again with
+  // a fresh workspace.  This makes kernel DB resets transparent to the user.
+  const isStaleWorkspace = (err) =>
+    err?.message?.includes("workspace_not_found") ||
+    err?.message?.includes("agent_not_found") ||
+    err?.message?.includes("agent_workspace_mismatch");
 
-  // ── Resolve (or create) session for this sender ───────────────────────────
-  let sessionId = null;
-  let contextSummary = "";
-  try {
-    const sessionRes = await kernelResolveSession(wsId, "whatsapp", sender, text);
-    sessionId = sessionRes.session_id ?? null;
-    contextSummary = sessionRes.session?.context_summary ?? "";
-    app.log.info(
-      { sender, session_id: sessionId, decision: sessionRes.decision, reason: sessionRes.reason },
-      "session resolved",
-    );
-    // Explicit reset: acknowledge, clear any stale pending, skip normal routing
-    if (sessionRes.decision === "new" && sessionRes.reason === "explicit_reset") {
-      clearSenderPending(sender);
-      await sendWhatsApp(sender, "Starting fresh. How can I help you?");
-      return { ok: true };
-    }
-  } catch (err) {
-    app.log.warn({ err, sender }, "kernelResolveSession failed — continuing without session");
-  }
+  const runRouting = async () => {
+    const wsId = await ensureWorkspace(sender);
 
-  // ── Resolve (or continue) cognitive objective ─────────────────────────────
-  // The objective pins the session to a concrete deliverable spec and enables
-  // follow-up binding, deliverable validation, and tool-truth enforcement.
-  let objectiveId = null;
-  let objectiveGoal = "";
-  if (sessionId) {
+    // ── Resolve (or create) session for this sender ─────────────────────────
+    let sessionId = null;
+    let contextSummary = "";
     try {
-      const objRes = await kernelResolveObjective(wsId, sender, sessionId, text);
-      if (objRes.ok) {
-        objectiveId = objRes.objective_id ?? null;
-        objectiveGoal = objRes.goal ?? "";
-        app.log.info(
-          {
-            sender,
-            session_id: sessionId,
-            objective_id: objectiveId,
-            obj_decision: objRes.decision,
-            obj_reason: objRes.reason,
-          },
-          "objective resolved",
-        );
+      const sessionRes = await kernelResolveSession(wsId, "whatsapp", sender, text);
+      sessionId = sessionRes.session_id ?? null;
+      contextSummary = sessionRes.session?.context_summary ?? "";
+      app.log.info(
+        { sender, session_id: sessionId, decision: sessionRes.decision, reason: sessionRes.reason },
+        "session resolved",
+      );
+      if (sessionRes.decision === "new" && sessionRes.reason === "explicit_reset") {
+        clearSenderPending(sender);
+        await sendWhatsApp(sender, "Starting fresh. How can I help you?");
+        return;
       }
     } catch (err) {
-      app.log.warn({ err, sender }, "kernelResolveObjective failed — continuing without objective");
+      if (isStaleWorkspace(err)) {
+        throw err;
+      } // bubble up for retry
+      app.log.warn({ err, sender }, "kernelResolveSession failed — continuing without session");
     }
-  }
+
+    // ── Resolve (or continue) cognitive objective ──────────────────────────
+    let objectiveId = null;
+    let objectiveGoal = "";
+    if (sessionId) {
+      try {
+        const objRes = await kernelResolveObjective(wsId, sender, sessionId, text);
+        if (objRes.ok) {
+          objectiveId = objRes.objective_id ?? null;
+          objectiveGoal = objRes.goal ?? "";
+          app.log.info(
+            {
+              sender,
+              session_id: sessionId,
+              objective_id: objectiveId,
+              obj_decision: objRes.decision,
+              obj_reason: objRes.reason,
+            },
+            "objective resolved",
+          );
+        }
+      } catch (err) {
+        if (isStaleWorkspace(err)) {
+          throw err;
+        }
+        app.log.warn(
+          { err, sender },
+          "kernelResolveObjective failed — continuing without objective",
+        );
+      }
+    }
+
+    await routeMessage(sender, text, wsId, sessionId, contextSummary, objectiveId, objectiveGoal);
+  };
 
   try {
-    await routeMessage(sender, text, wsId, sessionId, contextSummary, objectiveId, objectiveGoal);
+    await runRouting();
   } catch (err) {
-    app.log.error({ err, sender, wsId }, "routeMessage failed");
-    await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
-    return reply.code(500).send({ error: "route_failed" });
+    if (isStaleWorkspace(err)) {
+      app.log.warn(
+        { sender, err: err.message },
+        "stale workspace mid-routing — resetting and retrying",
+      );
+      try {
+        await resetAndEnsureAgent(sender);
+        await runRouting();
+      } catch (retryErr) {
+        app.log.error({ retryErr, sender }, "routing retry failed");
+        await sendWhatsApp(sender, `Bridge error: ${retryErr.message}`).catch(() => {});
+        return reply.code(500).send({ error: "route_failed" });
+      }
+    } else {
+      app.log.error({ err, sender }, "routeMessage failed");
+      await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
+      return reply.code(500).send({ error: "route_failed" });
+    }
   }
 
   return { ok: true };
