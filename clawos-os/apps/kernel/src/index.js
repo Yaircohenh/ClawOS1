@@ -18,6 +18,7 @@ import { mintDCT, verifyDCT }                                         from "./to
 import { runWorker }                                                   from "./workers/runner.js";
 import { verifyTask }                                                  from "./verify/service.js";
 import { registerClawhubRoutes }                                       from "./clawhub/routes.js";
+import { registerSessionRoutes }                                       from "./sessions/routes.js";
 
 const PORT = Number(process.env.KERNEL_PORT || 18888);
 const DB_PATH = process.env.DB_PATH || "./kernel.db";
@@ -189,6 +190,25 @@ CREATE TABLE IF NOT EXISTS task_events (
   data_json     TEXT NOT NULL
 );
 
+-- ── Conversation Sessions ─────────────────────────────────────────────────────
+-- One session = one coherent conversation thread (multi-turn).
+-- The bridge resolves / creates a session on every inbound message.
+CREATE TABLE IF NOT EXISTS sessions (
+  session_id      TEXT PRIMARY KEY,
+  workspace_id    TEXT NOT NULL,
+  channel         TEXT NOT NULL DEFAULT 'whatsapp',
+  remote_jid      TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'active',   -- active | closed
+  context_summary TEXT NOT NULL DEFAULT '',
+  active_agent_id TEXT,
+  last_message_at TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  closed_at       TEXT,
+  turn_count      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_ws_jid
+  ON sessions(workspace_id, channel, remote_jid, status);
+
 -- ── Skills Marketplace ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS installed_skills (
   slug           TEXT PRIMARY KEY,
@@ -202,6 +222,20 @@ CREATE TABLE IF NOT EXISTS installed_skills (
   build_prompt   TEXT
 );
 `);
+
+// ── Safe schema migrations (additive, idempotent) ─────────────────────────────
+// Add session_id to action_requests and dct_approval_requests if not present.
+// SQLite ALTER TABLE only supports adding nullable columns, which is exactly what we need.
+{
+  const migrations = [
+    "ALTER TABLE action_requests       ADD COLUMN session_id TEXT",
+    "ALTER TABLE dct_approval_requests ADD COLUMN session_id TEXT",
+    "ALTER TABLE approvals             ADD COLUMN session_id TEXT",
+  ];
+  for (const sql of migrations) {
+    try { db.exec(sql); } catch { /* column already exists — safe to ignore */ }
+  }
+}
 
 // Seed default risk policies (auto for read actions, ask for write/side-effect actions)
 {
@@ -1461,6 +1495,11 @@ app.get("/kernel/health", async () => {
 // ClaWHub Skills Marketplace routes
 // --------------------
 registerClawhubRoutes(app, db);
+
+// --------------------
+// Session routes
+// --------------------
+registerSessionRoutes(app, db);
 
 // --------------------
 void app.listen({ port: PORT, host: "0.0.0.0" });
