@@ -1,0 +1,14 @@
+{
+  "name": "clawos-bridge",
+  "version": "0.1.0",
+  "description": "WhatsApp → Kernel bridge for ClawOS",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --env-file=.env --watch src/index.js",
+    "start": "node --env-file=.env src/index.js"
+  },
+  "dependencies": {
+    "fastify": "^4.28.0"
+  }
+}

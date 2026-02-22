@@ -204,6 +204,11 @@ export async function monitorWebChannel(
         status.lastEventAt = lastMessageAt;
         emitStatus();
         _lastInboundMsg = msg;
+        try {
+          tuning.messageSink?.(msg);
+        } catch {
+          /* bridge errors must never crash the WhatsApp loop */
+        }
         await onMessage(msg);
       },
     });
