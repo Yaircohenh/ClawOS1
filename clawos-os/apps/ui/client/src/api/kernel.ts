@@ -41,6 +41,17 @@ async function del<T>(path: string): Promise<T> {
   return json;
 }
 
+async function patch<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  const json = await res.json();
+  if (!res.ok) {throw new Error(json?.error ?? `PATCH ${path} failed (${res.status})`);}
+  return json;
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface KernelHealth {
@@ -129,6 +140,64 @@ export interface RiskPolicy {
   updated_at: string;
 }
 
+// ── ClaWHub Skills Marketplace types ──────────────────────────────────────────
+
+export interface ClawhubSkill {
+  slug: string;
+  name?: string;
+  display_name?: string;
+  summary?: string;
+  description?: string;
+  version?: string;
+  stars?: number;
+  installs?: number;
+  moderation?: { isMalwareBlocked?: boolean; isSuspicious?: boolean };
+  skill_md?: string;
+}
+
+export interface VettingIssue {
+  level: "critical" | "warning" | "info";
+  message: string;
+}
+
+export interface VettingReport {
+  safe: boolean;
+  score: number;
+  issues: VettingIssue[];
+}
+
+export interface RequiredKey {
+  envVar: string;
+  label: string;
+  url: string;
+}
+
+export interface ClawhubSkillDetailResponse {
+  ok: boolean;
+  skill: ClawhubSkill;
+  vetting: VettingReport;
+  requiredKeys: RequiredKey[];
+}
+
+export interface InstalledSkill {
+  slug: string;
+  display_name: string;
+  version: string;
+  installed_at: string;
+  enabled: number;   // 0 | 1
+  source: "clawhub" | "built";
+  build_prompt?: string | null;
+}
+
+export interface BuildResult {
+  ok: boolean;
+  slug: string;
+  displayName: string;
+  skillMd: string;
+  scriptContent: string;
+  scriptFilename: string;
+}
+
 // ── API functions ─────────────────────────────────────────────────────────────
 
 export const kernelApi = {
@@ -177,4 +246,26 @@ export const kernelApi = {
   listPolicies: () => get<{ ok: boolean; policies: RiskPolicy[] }>("/risk_policies"),
   setPolicy: (actionType: string, mode: "auto" | "ask" | "block") =>
     put(`/risk_policies/${actionType}`, { mode }),
+
+  // ClaWHub Skills Marketplace
+  clawhub: {
+    explore: (sort = "trending", limit = 24) =>
+      get<{ ok: boolean; skills: ClawhubSkill[] }>("/clawhub/explore", { sort, limit }),
+    search: (q: string, limit = 20) =>
+      get<{ ok: boolean; skills: ClawhubSkill[] }>("/clawhub/search", { q, limit }),
+    getSkill: (slug: string) =>
+      get<ClawhubSkillDetailResponse>(`/clawhub/skill/${encodeURIComponent(slug)}`),
+    install: (slug: string, acceptDisclaimer: boolean) =>
+      post<{ ok: boolean; slug: string }>("/clawhub/install", { slug, acceptDisclaimer }),
+    uninstall: (slug: string) =>
+      del<{ ok: boolean; slug: string }>(`/clawhub/install/${encodeURIComponent(slug)}`),
+    listInstalled: () =>
+      get<{ ok: boolean; skills: InstalledSkill[] }>("/clawhub/installed"),
+    toggleEnabled: (slug: string, enabled: boolean) =>
+      patch<{ ok: boolean; slug: string; enabled: boolean }>(`/clawhub/installed/${encodeURIComponent(slug)}`, { enabled }),
+    build: (description: string) =>
+      post<BuildResult>("/clawhub/build", { description }),
+    activate: (data: BuildResult & { description?: string }) =>
+      post<{ ok: boolean; slug: string }>("/clawhub/activate", data),
+  },
 };

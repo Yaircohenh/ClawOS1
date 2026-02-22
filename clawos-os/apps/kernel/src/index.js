@@ -17,6 +17,7 @@ import { evaluateScope }                                               from "./p
 import { mintDCT, verifyDCT }                                         from "./tokens/delegation.js";
 import { runWorker }                                                   from "./workers/runner.js";
 import { verifyTask }                                                  from "./verify/service.js";
+import { registerClawhubRoutes }                                       from "./clawhub/routes.js";
 
 const PORT = Number(process.env.KERNEL_PORT || 18888);
 const DB_PATH = process.env.DB_PATH || "./kernel.db";
@@ -186,6 +187,19 @@ CREATE TABLE IF NOT EXISTS task_events (
   type          TEXT NOT NULL,
   ts            TEXT NOT NULL,
   data_json     TEXT NOT NULL
+);
+
+-- ── Skills Marketplace ────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS installed_skills (
+  slug           TEXT PRIMARY KEY,
+  display_name   TEXT NOT NULL,
+  version        TEXT NOT NULL,
+  installed_at   TEXT NOT NULL,
+  skill_md       TEXT NOT NULL,
+  vetting_json   TEXT NOT NULL,        -- { safe, issues[], score }
+  enabled        INTEGER NOT NULL DEFAULT 1,
+  source         TEXT NOT NULL DEFAULT 'clawhub',  -- 'clawhub' | 'built'
+  build_prompt   TEXT
 );
 `);
 
@@ -1442,6 +1456,11 @@ app.get("/kernel/health", async () => {
     version: "0.1.0",
   };
 });
+
+// --------------------
+// ClaWHub Skills Marketplace routes
+// --------------------
+registerClawhubRoutes(app, db);
 
 // --------------------
 void app.listen({ port: PORT, host: "0.0.0.0" });
