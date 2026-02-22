@@ -470,8 +470,14 @@ export const whatsappPlugin: ChannelPlugin<ResolvedWhatsAppAccount> = {
  * When BRIDGE_WEBHOOK_URL is set, returns a messageSink that fire-and-forgets
  * each inbound message as a JSON POST to the bridge. Errors are swallowed so
  * that bridge unavailability can never affect the WhatsApp connection.
+ *
+ * Returns `true` for bridge command messages (!run, !approve, !deny) to signal
+ * that they have been consumed and should NOT be forwarded to the Claude agent.
+ * This prevents the Claude agent from seeing approval prompts and auto-approving.
  */
-function buildBridgeMessageSink(): { messageSink?: (msg: Record<string, unknown>) => void } {
+function buildBridgeMessageSink(): {
+  messageSink?: (msg: Record<string, unknown>) => boolean | void;
+} {
   const bridgeUrl = process.env.BRIDGE_WEBHOOK_URL;
   if (!bridgeUrl) return {};
   const secret = process.env.BRIDGE_SECRET;
@@ -487,6 +493,12 @@ function buildBridgeMessageSink(): { messageSink?: (msg: Record<string, unknown>
         },
         body: JSON.stringify(payload),
       }).catch(() => {}); // Bridge failure must never crash the WhatsApp loop.
+
+      // Consume bridge commands so the Claude agent never sees them.
+      // The agent seeing "!approve ap_xxx" in its context would cause it to
+      // autonomously re-send the approval, creating a self-approval loop.
+      const body = String(msg.body ?? "");
+      return body.startsWith("!run ") || body.startsWith("!approve ") || body.startsWith("!deny ");
     },
   };
 }
