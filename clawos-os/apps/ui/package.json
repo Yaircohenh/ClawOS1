@@ -2,7 +2,14 @@
   "name": "clawos-ui",
   "private": true,
   "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "build": "cd client && npm install && npm run build",
+    "dev:server": "node src/index.js",
+    "dev:client": "cd client && npm run dev"
+  },
   "dependencies": {
-    "fastify": "^4.28.1"
+    "fastify": "^4.28.1",
+    "@fastify/static": "^7.0.4"
   }
 }

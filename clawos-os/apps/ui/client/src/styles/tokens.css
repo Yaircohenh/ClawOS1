@@ -1,0 +1,80 @@
+/* ── ClawOS Design Tokens ─────────────────────────────────────────────────── */
+
+:root {
+  /* Backgrounds — 3 elevation levels */
+  --bg:          #0f1117;
+  --bg-1:        #13161f;
+  --bg-2:        #1a1d27;
+  --bg-hover:    #222636;
+  --bg-muted:    #1e2130;
+
+  /* Text */
+  --text:        #e4e4e7;
+  --text-strong: #fafafa;
+  --muted:       #71717a;
+  --muted-2:     #52525b;
+
+  /* Borders */
+  --border:      #27272a;
+  --border-2:    #3f3f46;
+  --border-hover:#52525b;
+
+  /* Accent — ClawOS Blue */
+  --accent:         #5c7be0;
+  --accent-hover:   #7090e8;
+  --accent-subtle:  rgba(92, 123, 224, 0.15);
+  --accent-glow:    rgba(92, 123, 224, 0.25);
+
+  /* Status */
+  --ok:           #22c55e;
+  --ok-subtle:    rgba(34, 197, 94, 0.12);
+  --warn:         #f59e0b;
+  --warn-subtle:  rgba(245, 158, 11, 0.12);
+  --danger:       #ef4444;
+  --danger-subtle:rgba(239, 68, 68, 0.12);
+  --info:         #3b82f6;
+  --info-subtle:  rgba(59, 130, 246, 0.12);
+
+  /* Typography */
+  --font-body: "Space Grotesk", system-ui, sans-serif;
+  --mono:      "JetBrains Mono", "Fira Code", monospace;
+
+  /* Radius */
+  --r-sm: 5px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-full: 9999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.25);
+  --shadow-md: 0 4px 12px rgba(0,0,0,.3), 0 0 0 1px rgba(255,255,255,.03);
+  --shadow-lg: 0 12px 28px rgba(0,0,0,.4), 0 0 0 1px rgba(255,255,255,.03);
+
+  /* Transitions */
+  --ease:     cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-std: cubic-bezier(0.4, 0, 0.2, 1);
+  --fast:     120ms;
+  --normal:   200ms;
+  --slow:     350ms;
+
+  /* Layout */
+  --nav-w: 220px;
+  --topbar-h: 52px;
+}
+
+/* Light theme overrides (opt-in via html.light) */
+html.light {
+  --bg:          #f9fafb;
+  --bg-1:        #f3f4f6;
+  --bg-2:        #ffffff;
+  --bg-hover:    #e5e7eb;
+  --bg-muted:    #f1f3f7;
+  --text:        #1f2937;
+  --text-strong: #111827;
+  --muted:       #6b7280;
+  --muted-2:     #9ca3af;
+  --border:      #e5e7eb;
+  --border-2:    #d1d5db;
+  --border-hover:#9ca3af;
+}

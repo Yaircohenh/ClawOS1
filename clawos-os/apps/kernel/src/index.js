@@ -1040,6 +1040,66 @@ app.get("/kernel/tasks/:task_id/events", async (req, reply) => {
   return { ok: true, task_id: req.params.task_id, event_count: events.length, events };
 });
 
+// ── Task List (dashboard) ─────────────────────────────────────────────────────
+
+app.get("/kernel/tasks", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({
+    status: z.string().optional(),
+    limit:  z.coerce.number().int().min(1).max(500).optional().default(50),
+  });
+  const query = Schema.parse(req.query ?? {});
+
+  let stmt;
+  if (query.status) {
+    stmt = db.prepare(
+      `SELECT task_id, title, status, workspace_id, created_at
+         FROM tasks WHERE status=? ORDER BY created_at DESC LIMIT ?`
+    ).all(query.status, query.limit);
+  } else {
+    stmt = db.prepare(
+      `SELECT task_id, title, status, workspace_id, created_at
+         FROM tasks ORDER BY created_at DESC LIMIT ?`
+    ).all(query.limit);
+  }
+
+  return { ok: true, tasks: stmt };
+});
+
+// ── Global Events List (dashboard / logs) ─────────────────────────────────────
+
+app.get("/kernel/events", async (req, reply) => {
+  if (!assertUnlocked(reply)) {return { ok: false, error: "kernel_locked" };}
+
+  const Schema = z.object({
+    limit: z.coerce.number().int().min(1).max(500).optional().default(50),
+    task_id: z.string().optional(),
+  });
+  const query = Schema.parse(req.query ?? {});
+
+  let rows;
+  if (query.task_id) {
+    rows = db.prepare(
+      `SELECT event_id, workspace_id, task_id, actor_kind, actor_id, type, ts, data_json
+         FROM task_events WHERE task_id=? ORDER BY ts DESC LIMIT ?`
+    ).all(query.task_id, query.limit);
+  } else {
+    rows = db.prepare(
+      `SELECT event_id, workspace_id, task_id, actor_kind, actor_id, type, ts, data_json
+         FROM task_events ORDER BY ts DESC LIMIT ?`
+    ).all(query.limit);
+  }
+
+  const events = rows.map(r => ({
+    ...r,
+    data: r.data_json ? JSON.parse(r.data_json) : null,
+    data_json: undefined,
+  }));
+
+  return { ok: true, events };
+});
+
 // ============================================================================
 // SUBAGENTS — POST /kernel/subagents  &  GET & /run
 // Subagents are ephemeral workers. They CANNOT request approvals or mint tokens.
