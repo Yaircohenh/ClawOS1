@@ -3,6 +3,9 @@ import { getSecret } from "../connections.js";
 export const action = {
   name: "web_search",
   writes: false,
+  risk_level: "low",
+  reversible: true,
+  description: "Search the web for information",
   async run(req, ctx) {
     const q = req.payload?.q || req.payload?.query || "";
     if (!q) {throw new Error("payload.q (or payload.query) is required");}

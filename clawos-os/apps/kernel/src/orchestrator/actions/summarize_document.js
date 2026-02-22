@@ -6,6 +6,9 @@ const MAX_LLM_INPUT = 30000; // chars fed to Anthropic to keep costs reasonable
 export const action = {
   name: "summarize_document",
   writes: false,
+  risk_level: "low",
+  reversible: true,
+  description: "Summarize the contents of a document",
   async run(req, ctx) {
     const text = req.payload?.text;
     const pageCount = req.payload?.page_count ?? 0;

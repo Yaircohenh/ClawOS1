@@ -68,6 +68,24 @@ function isApproved(req, db) {
   return true;
 }
 
+/** Resolve the risk policy mode for this action_type from the DB. */
+function resolvePolicy(action, req, db) {
+  if (db) {
+    // Workspace-specific policy takes precedence over wildcard
+    const wsRow = db.prepare(
+      `SELECT mode FROM risk_policies WHERE action_type=? AND workspace_id=?`
+    ).get(req.action_type, req.workspace_id);
+    if (wsRow) {return wsRow.mode;}
+
+    const globalRow = db.prepare(
+      `SELECT mode FROM risk_policies WHERE action_type=? AND workspace_id='*'`
+    ).get(req.action_type);
+    if (globalRow) {return globalRow.mode;}
+  }
+  // Fallback: reads = auto, writes = ask
+  return action.writes ? "ask" : "auto";
+}
+
 // Fix #2: accept { db } so isApproved() can query tool_tokens
 export async function dispatch(raw, { db } = {}) {
   const started = Date.now();
@@ -95,16 +113,34 @@ export async function dispatch(raw, { db } = {}) {
     return { ok: false, error: err, code: "unknown_action" };
   }
 
-  // Approval gate: ANY writes require a verified cap token
-  if (action.writes && !isApproved(req, db)) {
+  // ── Risk policy gate ──────────────────────────────────────────────────────
+  const policyMode = resolvePolicy(action, req, db);
+
+  if (policyMode === "block") {
+    const res = {
+      ok: false,
+      code: "blocked",
+      blocked: true,
+      request_id: req.request_id,
+      action_type: req.action_type,
+      message: `Action "${req.action_type}" is blocked by policy.`,
+    };
+    logEvent({ kind: "blocked", request_id: req.request_id, action_type: req.action_type });
+    return res;
+  }
+
+  // For "ask" mode: require a verified cap token (or operator scope)
+  if (policyMode === "ask" && !isApproved(req, db)) {
     const res = {
       ok: false,
       code: "approval_required",
       approval_required: true,
       request_id: req.request_id,
       action_type: req.action_type,
-      message:
-        "This action is write/dangerous. Provide operator.approvals scope OR approval_token.",
+      risk_level: action.risk_level ?? (action.writes ? "high" : "low"),
+      reversible: action.reversible ?? !action.writes,
+      description: action.description ?? action.name,
+      message: "This action requires approval. Reply: yes / no / more / edit",
     };
     logEvent({
       kind: "approval_required",
@@ -113,6 +149,7 @@ export async function dispatch(raw, { db } = {}) {
     });
     return res;
   }
+  // policyMode === "auto" → fall through and execute without approval
 
   try {
     const out = await action.run(req, { started_at: started, db });

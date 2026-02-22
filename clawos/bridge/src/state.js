@@ -44,7 +44,7 @@ export function saveWorkspaceId(sender, workspaceId) {
   persist("workspaces.json", workspaces);
 }
 
-// ── Pending approvals ─────────────────────────────────────────────────────────
+// ── Pending approvals (by approval_id — used by kernel API calls) ─────────────
 let approvals = load("approvals.json", {});
 
 export function savePendingApproval(approvalId, data) {
@@ -59,4 +59,27 @@ export function getPendingApproval(approvalId) {
 export function removePendingApproval(approvalId) {
   delete approvals[approvalId];
   persist("approvals.json", approvals);
+}
+
+// ── Per-sender latest-pending state (drives yes/no/more/edit UX) ──────────────
+// Stored shape: {
+//   approval_id, action_type, payload, workspace_id,
+//   action_request_id, agent_id,
+//   risk_level, reversible, description,
+//   editing: boolean   ← true while awaiting the user's replacement input
+// }
+let senderPending = load("sender_pending.json", {});
+
+export function setSenderPending(sender, data) {
+  senderPending[sender] = { ...data };
+  persist("sender_pending.json", senderPending);
+}
+
+export function getSenderPending(sender) {
+  return senderPending[sender] ?? null;
+}
+
+export function clearSenderPending(sender) {
+  delete senderPending[sender];
+  persist("sender_pending.json", senderPending);
 }

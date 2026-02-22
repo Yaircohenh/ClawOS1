@@ -6,6 +6,9 @@ const MAX_OUTPUT = 3000;
 export const action = {
   name: "run_shell",
   writes: true, // requires approval + capability token
+  risk_level: "high",
+  reversible: false,
+  description: "Run a shell command on the system",
   async run(req, _ctx) {
     const command = req.payload?.command ?? req.payload?.cmd ?? "";
     if (!command) { throw new Error("payload.command is required"); }

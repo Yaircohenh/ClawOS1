@@ -5,11 +5,14 @@
  * submits action requests to the Kernel, and sends replies back via the
  * bridge send server running inside the OpenClaw process.
  *
- * Supported WhatsApp commands:
- *   !run <shell command>   — submit run_shell (requires approval)
- *   !approve <approval_id> — approve: issue cap token + execute
- *   !deny <approval_id>    — reject a pending kernel action
- *   <anything else>        — submitted as web_search { q: <text> }
+ * Approval UX (natural language — no IDs needed):
+ *   yes          — approve the latest pending action
+ *   no           — deny the latest pending action
+ *   more         — get a detailed explanation of what will happen
+ *   edit         — enter edit mode: next message replaces the pending input
+ *
+ *   !run <cmd>   — explicitly request a shell command (still requires approval)
+ *   <anything>   — submitted as web_search { q: <text> } (auto mode by default)
  */
 import Fastify from "fastify";
 import {
@@ -27,6 +30,9 @@ import {
   savePendingApproval,
   getPendingApproval,
   removePendingApproval,
+  getSenderPending,
+  setSenderPending,
+  clearSenderPending,
 } from "./state.js";
 
 const PORT = Number(process.env.BRIDGE_PORT ?? 18790);
@@ -113,6 +119,90 @@ function formatResult(exec) {
   );
 }
 
+// ── Approval message builder ───────────────────────────────────────────────────
+function buildApprovalMessage(pending) {
+  const { action_type, payload, description, risk_level, reversible } = pending;
+
+  const riskLabel =
+    {
+      low: "Low",
+      medium: "Medium",
+      high: "High",
+      critical: "Critical",
+    }[risk_level] ??
+    risk_level ??
+    "Unknown";
+
+  const reversibleLabel = reversible ? "Yes — action can be undone" : "No — permanent side-effects";
+
+  let detailLine = "";
+  if (action_type === "run_shell") {
+    detailLine = `Command: \`${payload?.command ?? ""}\`\n`;
+  } else if (action_type === "web_search") {
+    detailLine = `Query: "${payload?.q ?? ""}"\n`;
+  } else if (action_type === "write_file") {
+    detailLine = `File: ${payload?.path ?? ""}\n`;
+  } else if (action_type === "send_email") {
+    detailLine = `To: ${pending.agent_id ?? ""} | Subject: ${payload?.subject ?? ""}\n`;
+  }
+
+  return (
+    `*Approval needed*\n` +
+    `Action: ${description ?? action_type}\n` +
+    detailLine +
+    `Risk: ${riskLabel} | Reversible: ${reversibleLabel}\n\n` +
+    `Reply: *yes* · *no* · *more* · *edit*`
+  );
+}
+
+// ── Detailed "more" message builder ───────────────────────────────────────────
+function buildMoreMessage(pending) {
+  const { action_type, payload, description, risk_level, reversible } = pending;
+
+  const riskExplain =
+    {
+      low: "This action is read-only and cannot change any data.",
+      medium: "This action modifies data but the change is reversible.",
+      high: "This action has significant side-effects that may be hard to undo.",
+      critical: "This action is potentially destructive — proceed with extreme caution.",
+    }[risk_level] ?? "Risk level unknown.";
+
+  let payloadDetail = "";
+  if (action_type === "run_shell") {
+    payloadDetail = `Shell command to execute:\n\`\`\`\n${payload?.command ?? ""}\n\`\`\``;
+  } else if (action_type === "web_search") {
+    payloadDetail = `Search query: "${payload?.q ?? ""}"`;
+  } else if (action_type === "write_file") {
+    const preview = String(payload?.content ?? "").slice(0, 200);
+    payloadDetail = `File: ${payload?.path ?? ""}\nContent preview:\n${preview}${(payload?.content?.length ?? 0) > 200 ? "…" : ""}`;
+  } else if (action_type === "send_email") {
+    payloadDetail = `To: ${payload?.to ?? ""}\nSubject: ${payload?.subject ?? ""}\nBody preview: ${String(payload?.body ?? "").slice(0, 150)}`;
+  } else {
+    payloadDetail = JSON.stringify(payload ?? {}, null, 2);
+  }
+
+  return (
+    `*Details: ${description ?? action_type}*\n\n` +
+    `${payloadDetail}\n\n` +
+    `Risk level: ${risk_level ?? "unknown"}\n` +
+    `${riskExplain}\n` +
+    `Reversible: ${reversible ? "yes" : "no"}\n\n` +
+    `Reply: *yes* · *no* · *edit*`
+  );
+}
+
+// ── Register a pending approval in both maps ───────────────────────────────────
+function registerPending(sender, approvalId, data) {
+  savePendingApproval(approvalId, data);
+  setSenderPending(sender, { ...data, approval_id: approvalId, editing: false });
+}
+
+// ── Clear a pending approval from both maps ────────────────────────────────────
+function clearPending(sender, approvalId) {
+  removePendingApproval(approvalId);
+  clearSenderPending(sender);
+}
+
 // ── !approve handler (full flow: approve → issue token → retry) ───────────────
 async function handleApprove(sender, approvalId) {
   const pending = getPendingApproval(approvalId);
@@ -141,11 +231,11 @@ async function handleApprove(sender, approvalId) {
       { requestId: pending.action_request_id, approvalToken: tokenRes.token },
     );
 
-    removePendingApproval(approvalId);
+    clearPending(sender, approvalId);
 
     if (result.ok) {
       const reply = formatResult(result.exec);
-      await sendWhatsApp(sender, `Approved. Result:\n\n${reply}`);
+      await sendWhatsApp(sender, `Done:\n\n${reply}`);
     } else {
       await sendWhatsApp(
         sender,
@@ -168,11 +258,88 @@ async function handleDeny(sender, approvalId) {
   }
   try {
     await denyActionRequest(approvalId);
-    removePendingApproval(approvalId);
-    await sendWhatsApp(sender, `Denied: ${approvalId}`);
+    clearPending(sender, approvalId);
+    await sendWhatsApp(sender, `Cancelled.`);
     app.log.info({ sender, approvalId }, "approval denied");
   } catch (err) {
     await sendWhatsApp(sender, `Deny error: ${err.message}`);
+  }
+}
+
+// ── "yes" — approve sender's latest pending ───────────────────────────────────
+async function handleYes(sender) {
+  const sp = getSenderPending(sender);
+  if (!sp) {
+    await sendWhatsApp(sender, "No pending action to approve.");
+    return;
+  }
+  await handleApprove(sender, sp.approval_id);
+}
+
+// ── "no" — deny sender's latest pending ──────────────────────────────────────
+async function handleNo(sender) {
+  const sp = getSenderPending(sender);
+  if (!sp) {
+    await sendWhatsApp(sender, "No pending action to cancel.");
+    return;
+  }
+  await handleDeny(sender, sp.approval_id);
+}
+
+// ── "more" — show detailed explanation of latest pending ─────────────────────
+async function handleMore(sender) {
+  const sp = getSenderPending(sender);
+  if (!sp) {
+    await sendWhatsApp(sender, "No pending action.");
+    return;
+  }
+  await sendWhatsApp(sender, buildMoreMessage(sp));
+}
+
+// ── "edit" — enter editing mode, ask user for replacement ────────────────────
+async function handleEdit(sender) {
+  const sp = getSenderPending(sender);
+  if (!sp) {
+    await sendWhatsApp(sender, "No pending action to edit.");
+    return;
+  }
+
+  let editPrompt = "";
+  if (sp.action_type === "run_shell") {
+    editPrompt = `Current command:\n\`${sp.payload?.command ?? ""}\`\n\nSend the updated command (or *no* to cancel):`;
+  } else if (sp.action_type === "web_search") {
+    editPrompt = `Current query: "${sp.payload?.q ?? ""}"\n\nSend the updated search query (or *no* to cancel):`;
+  } else if (sp.action_type === "write_file") {
+    editPrompt = `Editing write to: ${sp.payload?.path ?? ""}\n\nSend the new file content (or *no* to cancel):`;
+  } else {
+    editPrompt = "Send the updated input (or *no* to cancel):";
+  }
+
+  setSenderPending(sender, { ...sp, editing: true });
+  await sendWhatsApp(sender, editPrompt);
+}
+
+// ── Handle "editing" response — user sent the replacement ────────────────────
+async function handleEditInput(sender, text, wsId) {
+  const sp = getSenderPending(sender);
+  if (!sp) {
+    // Editing state expired — treat as new message
+    await handleMessage(sender, text, wsId);
+    return;
+  }
+
+  // Cancel the old pending (orphan it in the kernel — it'll expire)
+  removePendingApproval(sp.approval_id);
+  clearSenderPending(sender);
+
+  // Re-submit with new input
+  if (sp.action_type === "run_shell") {
+    await handleRun(sender, text, wsId);
+  } else if (sp.action_type === "web_search") {
+    await handleMessage(sender, text, wsId);
+  } else {
+    // Generic fallback — treat new text as a query
+    await handleMessage(sender, text, wsId);
   }
 }
 
@@ -182,18 +349,19 @@ async function handleRun(sender, command, workspaceId) {
 
   if (result.approval_id) {
     const { approval_id, action_request_id } = result;
-    savePendingApproval(approval_id, {
+    const pendingData = {
       sender,
       workspace_id: workspaceId,
       action_request_id,
       action_type: "run_shell",
       payload: { command },
       agent_id: sender,
-    });
-    await sendWhatsApp(
-      sender,
-      `Approval required to run:\n> ${command}\n\nID: ${approval_id}\n\nReply:\n!approve ${approval_id}`,
-    );
+      risk_level: result.risk_level ?? "high",
+      reversible: result.reversible ?? false,
+      description: result.description ?? "Run a shell command on the system",
+    };
+    registerPending(sender, approval_id, pendingData);
+    await sendWhatsApp(sender, buildApprovalMessage(pendingData));
     app.log.info({ sender, approval_id, command }, "run_shell approval required");
     return;
   }
@@ -244,19 +412,20 @@ async function handleMessage(sender, text, workspaceId) {
 
   if (result.approval_id) {
     const { approval_id, action_request_id } = result;
-    savePendingApproval(approval_id, {
+    const pendingData = {
       sender,
       workspace_id: workspaceId,
       action_request_id,
       action_type: "web_search",
       payload: { q: text },
       agent_id: sender,
-    });
-    await sendWhatsApp(
-      sender,
-      `Blocked. Approval needed: ${approval_id}\nReply: !approve ${approval_id}`,
-    );
-    app.log.info({ sender, approval_id }, "approval required");
+      risk_level: result.risk_level ?? "low",
+      reversible: result.reversible ?? true,
+      description: result.description ?? "Search the web for information",
+    };
+    registerPending(sender, approval_id, pendingData);
+    await sendWhatsApp(sender, buildApprovalMessage(pendingData));
+    app.log.info({ sender, approval_id }, "web_search approval required");
     return;
   }
 
@@ -306,21 +475,51 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     return { ok: true };
   }
 
-  // ── !approve <id> ─────────────────────────────────────────────────────────
-  if (text.startsWith("!approve ")) {
-    const approvalId = text.slice("!approve ".length).trim();
-    await handleApprove(sender, approvalId).catch((err) =>
-      app.log.error({ err, sender, approvalId }, "handleApprove failed"),
-    );
+  // ── Check if sender is in "editing" state ─────────────────────────────────
+  const senderState = getSenderPending(sender);
+  if (senderState?.editing) {
+    // "no" cancels editing too
+    const normalized = text.toLowerCase().trim();
+    if (normalized === "no") {
+      await handleNo(sender).catch((err) =>
+        app.log.error({ err, sender }, "handleNo (from edit) failed"),
+      );
+      return { ok: true };
+    }
+    let wsId;
+    try {
+      wsId = await ensureWorkspace(sender);
+    } catch (err) {
+      await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
+      return reply.code(500).send({ error: "workspace_error" });
+    }
+    await handleEditInput(sender, text, wsId).catch((err) => {
+      app.log.error({ err, sender }, "handleEditInput failed");
+      sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
+    });
     return { ok: true };
   }
 
-  // ── !deny <id> ────────────────────────────────────────────────────────────
-  if (text.startsWith("!deny ")) {
-    const approvalId = text.slice("!deny ".length).trim();
-    await handleDeny(sender, approvalId).catch((err) =>
-      app.log.error({ err, sender, approvalId }, "handleDeny failed"),
-    );
+  // ── Natural-language approval keywords ───────────────────────────────────
+  const normalized = text.toLowerCase().trim();
+
+  if (normalized === "yes" || normalized === "y") {
+    await handleYes(sender).catch((err) => app.log.error({ err, sender }, "handleYes failed"));
+    return { ok: true };
+  }
+
+  if (normalized === "no" || normalized === "n") {
+    await handleNo(sender).catch((err) => app.log.error({ err, sender }, "handleNo failed"));
+    return { ok: true };
+  }
+
+  if (normalized === "more" || normalized === "more info" || normalized === "more information") {
+    await handleMore(sender).catch((err) => app.log.error({ err, sender }, "handleMore failed"));
+    return { ok: true };
+  }
+
+  if (normalized === "edit") {
+    await handleEdit(sender).catch((err) => app.log.error({ err, sender }, "handleEdit failed"));
     return { ok: true };
   }
 

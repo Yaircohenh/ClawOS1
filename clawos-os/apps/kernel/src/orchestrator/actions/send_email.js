@@ -1,6 +1,9 @@
 export const action = {
   name: "send_email",
   writes: true, // yes: outbound side-effect
+  risk_level: "high",
+  reversible: false,
+  description: "Send an email to a recipient",
   async run(req, _ctx) {
     const dryRun = !!req.meta?.dry_run;
 

@@ -3,6 +3,9 @@ import { getWorkspaceRoot, writeTextFile } from "../fs-safe.js";
 export const action = {
   name: "write_file",
   writes: true,
+  risk_level: "medium",
+  reversible: true,
+  description: "Write or overwrite a file in the workspace",
   async run(req) {
     const p = req.payload?.path;
     const content = req.payload?.content;

@@ -69,7 +69,34 @@ CREATE TABLE IF NOT EXISTS connections (
   last_error TEXT,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS risk_policies (
+  action_type TEXT NOT NULL,
+  workspace_id TEXT NOT NULL DEFAULT '*',
+  mode TEXT NOT NULL DEFAULT 'ask',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (action_type, workspace_id)
+);
 `);
+
+// Seed default risk policies (auto for read actions, ask for write/side-effect actions)
+{
+  const defaults = [
+    { action_type: "web_search",        mode: "auto" },
+    { action_type: "read_file",         mode: "auto" },
+    { action_type: "summarize_document",mode: "auto" },
+    { action_type: "write_file",        mode: "ask"  },
+    { action_type: "run_shell",         mode: "ask"  },
+    { action_type: "send_email",        mode: "ask"  },
+  ];
+  const upsert = db.prepare(`
+    INSERT INTO risk_policies (action_type, workspace_id, mode, updated_at)
+    VALUES (?, '*', ?, ?)
+    ON CONFLICT(action_type, workspace_id) DO NOTHING
+  `);
+  const now = new Date().toISOString();
+  for (const { action_type, mode } of defaults) { upsert.run(action_type, mode, now); }
+}
 
 // Phase 3: delete expired tokens on every startup before accepting connections
 {
@@ -677,6 +704,29 @@ app.delete("/kernel/connections/:provider", async (req, reply) => {
   if (changes === 0) { reply.code(404); return { ok: false, error: "not_found" }; }
 
   return { ok: true, provider };
+});
+
+// --------------------
+// Risk Policies
+// --------------------
+app.get("/kernel/risk_policies", async () => {
+  const rows = db.prepare(`SELECT * FROM risk_policies ORDER BY action_type, workspace_id`).all();
+  return { ok: true, policies: rows };
+});
+
+app.put("/kernel/risk_policies/:action_type", async (req, _reply) => {
+  const Schema = z.object({
+    mode: z.enum(["auto", "ask", "block"]),
+    workspace_id: z.string().optional().default("*"),
+  });
+  const { action_type } = req.params;
+  const body = Schema.parse(req.body ?? {});
+  db.prepare(`
+    INSERT INTO risk_policies (action_type, workspace_id, mode, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(action_type, workspace_id) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at
+  `).run(action_type, body.workspace_id, body.mode, nowIso());
+  return { ok: true, action_type, workspace_id: body.workspace_id, mode: body.mode };
 });
 
 // --------------------
