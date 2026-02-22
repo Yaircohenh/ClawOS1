@@ -272,3 +272,72 @@ export async function kernelRunSubagent(subagentId, workspaceId, token, input) {
     input,
   });
 }
+
+// ── Cognitive Objective API ────────────────────────────────────────────────────
+
+/**
+ * Resolve or create a cognitive objective for an inbound message.
+ * Returns { ok, decision, reason, confidence, objective_id, goal, required_deliverable, title }.
+ */
+export async function kernelResolveObjective(workspaceId, agentId, sessionId, userMessage) {
+  return post("/kernel/objectives/resolve", {
+    workspace_id: workspaceId,
+    agent_id: agentId,
+    session_id: sessionId,
+    user_message: userMessage,
+  });
+}
+
+/**
+ * Update objective status / result after delivery.
+ * status: "completed" | "failed" | "in_progress"
+ */
+export async function kernelUpdateObjective(objectiveId, { status, result_summary = "" }) {
+  return patch(`/kernel/objectives/${objectiveId}`, { status, result_summary });
+}
+
+/**
+ * Record a real tool call as evidence for an objective.
+ * Prevents false tool claims in the response.
+ */
+export async function kernelAddToolEvidence(
+  objectiveId,
+  sessionId,
+  { action_type, query_text, result_summary },
+) {
+  return post(`/kernel/objectives/${objectiveId}/evidence`, {
+    session_id: sessionId,
+    action_type,
+    query_text: query_text ?? "",
+    result_summary: result_summary ?? "",
+  });
+}
+
+/**
+ * Run a cognitive_execute phase on the kernel.
+ * phase: "validate_deliverable" | "enforce_tool_truth" | "repair_deliverable"
+ */
+export async function kernelCognitivePhase(workspaceId, agentId, phase, payload) {
+  return post("/kernel/action_requests", {
+    workspace_id: workspaceId,
+    agent_id: agentId,
+    action_type: "cognitive_execute",
+    payload: { phase, ...payload },
+  });
+}
+
+/**
+ * Append a turn to a session's working-memory store (last-3 turns).
+ */
+export async function kernelAddSessionTurn(
+  objectiveId,
+  sessionId,
+  { user_message, assistant_response, action_type },
+) {
+  return post(`/kernel/objectives/${objectiveId}/turns`, {
+    session_id: sessionId,
+    user_message: user_message ?? "",
+    assistant_response: assistant_response ?? "",
+    action_type: action_type ?? "",
+  }).catch(() => {}); // non-fatal
+}

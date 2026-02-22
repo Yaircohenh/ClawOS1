@@ -19,6 +19,7 @@ import { runWorker }                                                   from "./w
 import { verifyTask }                                                  from "./verify/service.js";
 import { registerClawhubRoutes }                                       from "./clawhub/routes.js";
 import { registerSessionRoutes }                                       from "./sessions/routes.js";
+import { registerObjectiveRoutes }                                     from "./objectives/routes.js";
 
 const PORT = Number(process.env.KERNEL_PORT || 18888);
 const DB_PATH = process.env.DB_PATH || "./kernel.db";
@@ -221,6 +222,54 @@ CREATE TABLE IF NOT EXISTS installed_skills (
   source         TEXT NOT NULL DEFAULT 'clawhub',  -- 'clawhub' | 'built'
   build_prompt   TEXT
 );
+
+-- ── Cognitive Objectives ───────────────────────────────────────────────────────
+-- One objective = one bounded goal within a session.
+-- Persists across follow-up messages so the agent doesn't lose context.
+CREATE TABLE IF NOT EXISTS objectives (
+  objective_id              TEXT PRIMARY KEY,
+  session_id                TEXT NOT NULL,
+  workspace_id              TEXT NOT NULL,
+  agent_id                  TEXT NOT NULL,
+  title                     TEXT NOT NULL DEFAULT '',
+  goal                      TEXT NOT NULL DEFAULT '',
+  constraints_json          TEXT NOT NULL DEFAULT '{}',
+  required_deliverable_json TEXT NOT NULL DEFAULT 'null',
+  status                    TEXT NOT NULL DEFAULT 'in_progress',  -- in_progress|completed|failed
+  result_summary            TEXT NOT NULL DEFAULT '',
+  last_tool_evidence_json   TEXT NOT NULL DEFAULT '[]',
+  created_at                TEXT NOT NULL,
+  updated_at                TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_objectives_session
+  ON objectives(session_id, status);
+
+-- Tool evidence: records of actual tool calls keyed by objective.
+-- Used to enforce "no fake tool claims" rule.
+CREATE TABLE IF NOT EXISTS tool_evidence (
+  evidence_id    TEXT PRIMARY KEY,
+  objective_id   TEXT NOT NULL,
+  session_id     TEXT NOT NULL,
+  action_type    TEXT NOT NULL,
+  query_text     TEXT NOT NULL DEFAULT '',
+  result_summary TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_evidence_objective
+  ON tool_evidence(objective_id);
+
+-- Session turns: stores last N turns per session for working-memory injection.
+CREATE TABLE IF NOT EXISTS session_turns (
+  turn_id            TEXT PRIMARY KEY,
+  session_id         TEXT NOT NULL,
+  user_message       TEXT NOT NULL DEFAULT '',
+  assistant_response TEXT NOT NULL DEFAULT '',
+  action_type        TEXT NOT NULL DEFAULT '',
+  objective_id       TEXT,
+  created_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_turns
+  ON session_turns(session_id, created_at DESC);
 `);
 
 // ── Safe schema migrations (additive, idempotent) ─────────────────────────────
@@ -231,6 +280,8 @@ CREATE TABLE IF NOT EXISTS installed_skills (
     "ALTER TABLE action_requests       ADD COLUMN session_id TEXT",
     "ALTER TABLE dct_approval_requests ADD COLUMN session_id TEXT",
     "ALTER TABLE approvals             ADD COLUMN session_id TEXT",
+    // Cognitive objective binding on sessions
+    "ALTER TABLE sessions              ADD COLUMN active_objective_id TEXT",
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists — safe to ignore */ }
@@ -245,6 +296,7 @@ CREATE TABLE IF NOT EXISTS installed_skills (
     { action_type: "summarize_document",mode: "auto" },
     { action_type: "classify_intent",   mode: "auto" },
     { action_type: "interpret_result",  mode: "auto" },
+    { action_type: "cognitive_execute", mode: "auto" },
     { action_type: "write_file",        mode: "ask"  },
     { action_type: "run_shell",         mode: "ask"  },
     { action_type: "send_email",        mode: "ask"  },
@@ -1500,6 +1552,11 @@ registerClawhubRoutes(app, db);
 // Session routes
 // --------------------
 registerSessionRoutes(app, db);
+
+// --------------------
+// Cognitive Objective routes
+// --------------------
+registerObjectiveRoutes(app, db);
 
 // --------------------
 void app.listen({ port: PORT, host: "0.0.0.0" });
