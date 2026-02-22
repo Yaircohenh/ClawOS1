@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS risk_policies (
     { action_type: "web_search",        mode: "auto" },
     { action_type: "read_file",         mode: "auto" },
     { action_type: "summarize_document",mode: "auto" },
+    { action_type: "classify_intent",   mode: "auto" },
     { action_type: "write_file",        mode: "ask"  },
     { action_type: "run_shell",         mode: "ask"  },
     { action_type: "send_email",        mode: "ask"  },

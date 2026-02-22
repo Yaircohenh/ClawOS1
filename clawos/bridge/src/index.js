@@ -11,8 +11,9 @@
  *   more         — get a detailed explanation of what will happen
  *   edit         — enter edit mode: next message replaces the pending input
  *
- *   !run <cmd>   — explicitly request a shell command (still requires approval)
- *   <anything>   — submitted as web_search { q: <text> } (auto mode by default)
+ *   <anything>   — classified by Claude Haiku → routed to the best action
+ *                  (web_search, run_shell, write_file, read_file)
+ *                  Falls back to keyword heuristics when no Anthropic key.
  */
 import Fastify from "fastify";
 import {
@@ -324,7 +325,7 @@ async function handleEditInput(sender, text, wsId) {
   const sp = getSenderPending(sender);
   if (!sp) {
     // Editing state expired — treat as new message
-    await handleMessage(sender, text, wsId);
+    await routeMessage(sender, text, wsId);
     return;
   }
 
@@ -332,14 +333,13 @@ async function handleEditInput(sender, text, wsId) {
   removePendingApproval(sp.approval_id);
   clearSenderPending(sender);
 
-  // Re-submit with new input
   if (sp.action_type === "run_shell") {
+    // User edited a shell command — use the raw text as-is (no re-classification)
     await handleRun(sender, text, wsId);
-  } else if (sp.action_type === "web_search") {
-    await handleMessage(sender, text, wsId);
   } else {
-    // Generic fallback — treat new text as a query
-    await handleMessage(sender, text, wsId);
+    // For all other types re-route through classify so the edited text is
+    // dispatched to the best action (user may have pivoted from search to a command)
+    await routeMessage(sender, text, wsId);
   }
 }
 
@@ -406,9 +406,9 @@ async function handleDocument(sender, msg, workspaceId) {
   await sendWhatsApp(sender, `Kernel error: ${result.error ?? JSON.stringify(result)}`);
 }
 
-// ── Normal message handler (web_search) ───────────────────────────────────────
-async function handleMessage(sender, text, workspaceId) {
-  const result = await submitActionRequest(workspaceId, sender, "web_search", { q: text });
+// ── Web search handler (direct, no classification) ────────────────────────────
+async function handleWebSearch(sender, query, workspaceId) {
+  const result = await submitActionRequest(workspaceId, sender, "web_search", { q: query });
 
   if (result.approval_id) {
     const { approval_id, action_request_id } = result;
@@ -417,7 +417,7 @@ async function handleMessage(sender, text, workspaceId) {
       workspace_id: workspaceId,
       action_request_id,
       action_type: "web_search",
-      payload: { q: text },
+      payload: { q: query },
       agent_id: sender,
       risk_level: result.risk_level ?? "low",
       reversible: result.reversible ?? true,
@@ -438,6 +438,94 @@ async function handleMessage(sender, text, workspaceId) {
     sender,
     `Kernel error: ${result.error?.message ?? JSON.stringify(result.error ?? result)}`,
   );
+}
+
+// ── Generic action handler (write_file, read_file, etc.) ─────────────────────
+async function handleDirectAction(sender, actionType, params, workspaceId) {
+  const result = await submitActionRequest(workspaceId, sender, actionType, params);
+
+  if (result.approval_id) {
+    const { approval_id, action_request_id } = result;
+    const pendingData = {
+      sender,
+      workspace_id: workspaceId,
+      action_request_id,
+      action_type: actionType,
+      payload: params,
+      agent_id: sender,
+      risk_level: result.risk_level ?? "medium",
+      reversible: result.reversible ?? true,
+      description: result.description ?? actionType,
+    };
+    registerPending(sender, approval_id, pendingData);
+    await sendWhatsApp(sender, buildApprovalMessage(pendingData));
+    app.log.info({ sender, approval_id, actionType }, "action approval required");
+    return;
+  }
+
+  if (result.ok) {
+    await sendWhatsApp(sender, formatResult(result.exec ?? result));
+    return;
+  }
+
+  await sendWhatsApp(
+    sender,
+    `Kernel error: ${result.error?.message ?? JSON.stringify(result.error ?? result)}`,
+  );
+}
+
+// ── NL Router: classify → dispatch ───────────────────────────────────────────
+// Confidence thresholds — conservative to avoid accidental shell execution
+const CONFIDENCE = { run_shell: 0.7, write_file: 0.75, read_file: 0.7 };
+
+async function routeMessage(sender, text, workspaceId) {
+  // Classify intent via kernel action (uses Claude Haiku, falls back to heuristics)
+  let classified = null;
+  try {
+    const cls = await submitActionRequest(workspaceId, sender, "classify_intent", { text });
+    if (cls.ok && cls.exec?.result) {
+      classified = cls.exec.result;
+      app.log.info(
+        {
+          sender,
+          action_type: classified.action_type,
+          confidence: classified.confidence,
+          mode: classified.mode,
+        },
+        "classified",
+      );
+    }
+  } catch (err) {
+    app.log.warn({ err, sender }, "classify_intent failed — falling back to web_search");
+  }
+
+  if (classified) {
+    const { action_type, params, confidence } = classified;
+
+    if (action_type === "run_shell" && confidence >= CONFIDENCE.run_shell) {
+      const command = params?.command ?? text;
+      await handleRun(sender, command, workspaceId);
+      return;
+    }
+
+    if (action_type === "write_file" && confidence >= CONFIDENCE.write_file) {
+      await handleDirectAction(sender, "write_file", params, workspaceId);
+      return;
+    }
+
+    if (action_type === "read_file" && confidence >= CONFIDENCE.read_file) {
+      await handleDirectAction(sender, "read_file", params, workspaceId);
+      return;
+    }
+
+    // web_search, none, or below-threshold confidence → web_search fallback
+    const query = params?.q ?? text;
+    await handleWebSearch(sender, query, workspaceId);
+    return;
+  }
+
+  // Classification unavailable — fall back to web_search
+  await handleWebSearch(sender, text, workspaceId);
 }
 
 // ── Inbound webhook ───────────────────────────────────────────────────────────
@@ -523,28 +611,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     return { ok: true };
   }
 
-  // ── !run <command> ────────────────────────────────────────────────────────
-  if (text.startsWith("!run ")) {
-    const command = text.slice("!run ".length).trim();
-    if (!command) {
-      await sendWhatsApp(sender, "Usage: !run <shell command>").catch(() => {});
-      return { ok: true };
-    }
-    let wsId;
-    try {
-      wsId = await ensureWorkspace(sender);
-    } catch (err) {
-      await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
-      return reply.code(500).send({ error: "workspace_error" });
-    }
-    await handleRun(sender, command, wsId).catch((err) => {
-      app.log.error({ err, sender, command }, "handleRun failed");
-      sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
-    });
-    return { ok: true };
-  }
-
-  // ── Normal message → web_search ───────────────────────────────────────────
+  // ── Route message through intent classifier ───────────────────────────────
   let wsId;
   try {
     wsId = await ensureWorkspace(sender);
@@ -555,11 +622,11 @@ app.post("/webhook/whatsapp", async (req, reply) => {
   }
 
   try {
-    await handleMessage(sender, text, wsId);
+    await routeMessage(sender, text, wsId);
   } catch (err) {
-    app.log.error({ err, sender, wsId }, "handleMessage failed");
+    app.log.error({ err, sender, wsId }, "routeMessage failed");
     await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
-    return reply.code(500).send({ error: "action_failed" });
+    return reply.code(500).send({ error: "route_failed" });
   }
 
   return { ok: true };
