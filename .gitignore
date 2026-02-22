@@ -100,9 +100,12 @@ package-lock.json
 # Local iOS signing overrides
 apps/ios/LocalSigning.xcconfig
 
-# local builds
-clawos-os/
+# ClawOS kernel runtime artifacts (source is tracked; global rules cover node_modules, .env, data/, .DS_Store)
+clawos-os/**/*.db
+clawos-os/**/*.db-shm
+clawos-os/**/*.db-wal
+clawos-os/**/*.bak*
+clawos-os/**/echo
 
 # ClawOS runtime
 data/
-

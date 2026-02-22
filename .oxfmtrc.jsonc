@@ -10,6 +10,7 @@
   "useTabs": false,
   "ignorePatterns": [
     "apps/",
+    "clawos-os/",
     "assets/",
     "docker-compose.yml",
     "dist/",
