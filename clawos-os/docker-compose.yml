@@ -1,0 +1,43 @@
+services:
+  kernel:
+    build: ./apps/kernel
+    environment:
+      - KERNEL_PORT=18888
+      - DB_PATH=/state/kernel.db
+    ports:
+      - "18888:18888"
+    volumes:
+      - clawos_state:/state
+
+  gateway:
+    build: ./apps/gateway
+    environment:
+      - GATEWAY_PORT=18889
+      - KERNEL_URL=http://kernel:18888
+    ports:
+      - "18889:18889"
+    depends_on:
+      - kernel
+
+  toolrunner:
+    build: ./apps/toolrunner
+    environment:
+      - TOOLRUNNER_PORT=18890
+      - KERNEL_URL=http://kernel:18888
+    ports:
+      - "18890:18890"
+    depends_on:
+      - kernel
+
+  ui:
+    build: ./apps/ui
+    environment:
+      - UI_PORT=18887
+      - KERNEL_URL=http://localhost:18888
+    ports:
+      - "18887:18887"
+    depends_on:
+      - kernel
+
+volumes:
+  clawos_state:
