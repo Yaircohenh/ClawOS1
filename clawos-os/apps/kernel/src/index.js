@@ -224,6 +224,14 @@ CREATE TABLE IF NOT EXISTS installed_skills (
   build_prompt   TEXT
 );
 
+-- Global env var store for skill API keys (one row per env var name).
+-- Values encrypted with AES-256-GCM using connections_key.
+CREATE TABLE IF NOT EXISTS skill_env_vars (
+  env_var     TEXT PRIMARY KEY,
+  encrypted   TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+
 -- ── Cognitive Objectives ───────────────────────────────────────────────────────
 -- One objective = one bounded goal within a session.
 -- Persists across follow-up messages so the agent doesn't lose context.

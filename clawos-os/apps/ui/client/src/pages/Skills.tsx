@@ -87,6 +87,8 @@ function InstallModal({
   isLoading,
   acceptedDisclaimer,
   setAcceptedDisclaimer,
+  keyValues,
+  setKeyValues,
   onInstall,
   onClose,
   isInstalling,
@@ -97,6 +99,8 @@ function InstallModal({
   isLoading: boolean;
   acceptedDisclaimer: boolean;
   setAcceptedDisclaimer: (v: boolean) => void;
+  keyValues: Record<string, string>;
+  setKeyValues: (v: Record<string, string>) => void;
   onInstall: () => void;
   onClose: () => void;
   isInstalling: boolean;
@@ -166,24 +170,33 @@ function InstallModal({
                 <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.06em" }}>
                   Required API Keys
                 </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                   {detail.requiredKeys.map((k) => (
-                    <div key={k.envVar} className="row" style={{ gap: 8, alignItems: "center" }}>
-                      <span style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--accent)", background: "var(--accent-subtle)", padding: "2px 8px", borderRadius: 4, flexShrink: 0 }}>
-                        {k.envVar}
-                      </span>
-                      <span style={{ fontSize: 12, color: "var(--muted)", flex: 1 }}>{k.label}</span>
-                      {k.url && (
-                        <a
-                          href={k.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="btn btn-sm"
-                          style={{ fontSize: 11 }}
-                        >
-                          Get key →
-                        </a>
-                      )}
+                    <div key={k.envVar} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                        <span style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--accent)", background: "var(--accent-subtle)", padding: "2px 8px", borderRadius: 4, flexShrink: 0 }}>
+                          {k.envVar}
+                        </span>
+                        <span style={{ fontSize: 12, color: "var(--muted)", flex: 1 }}>{k.label}</span>
+                        {k.url && (
+                          <a
+                            href={k.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="btn btn-sm"
+                            style={{ fontSize: 11 }}
+                          >
+                            Get key →
+                          </a>
+                        )}
+                      </div>
+                      <input
+                        className="input"
+                        type="password"
+                        placeholder={`Paste your ${k.envVar} here`}
+                        value={keyValues[k.envVar] ?? ""}
+                        onChange={(e) => setKeyValues({ ...keyValues, [k.envVar]: e.target.value })}
+                      />
                     </div>
                   ))}
                 </div>
@@ -554,6 +567,7 @@ export function Skills() {
   // Install modal
   const [installSlug, setInstallSlug]               = useState<string | null>(null);
   const [acceptedDisclaimer, setAcceptedDisclaimer] = useState(false);
+  const [keyValues, setKeyValues]                   = useState<Record<string, string>>({});
 
   // Build tab
   const [buildDesc, setBuildDesc]     = useState("");
@@ -598,10 +612,13 @@ export function Skills() {
 
   // ── Mutations ──────────────────────────────────────────────────────────────
   const installMut = useMutation({
-    mutationFn: ({ slug }: { slug: string }) => kernelApi.clawhub.install(slug, true),
+    mutationFn: ({ slug }: { slug: string }) =>
+      kernelApi.clawhub.install(slug, true, keyValues),
     onSuccess: () => {
       setInstallSlug(null);
+      setKeyValues({});
       void qc.invalidateQueries({ queryKey: ["clawhub-installed"] });
+      void qc.invalidateQueries({ queryKey: ["skill-keys"] });
     },
   });
 
@@ -675,7 +692,7 @@ export function Skills() {
           isLoading={isLoading}
           hasError={hasError}
           searchQuery={searchQuery}
-          onInstall={(slug) => { setInstallSlug(slug); setAcceptedDisclaimer(false); installMut.reset(); }}
+          onInstall={(slug) => { setInstallSlug(slug); setAcceptedDisclaimer(false); setKeyValues({}); installMut.reset(); }}
         />
       )}
 
@@ -712,8 +729,10 @@ export function Skills() {
           isLoading={skillDetailQ.isLoading}
           acceptedDisclaimer={acceptedDisclaimer}
           setAcceptedDisclaimer={setAcceptedDisclaimer}
+          keyValues={keyValues}
+          setKeyValues={setKeyValues}
           onInstall={() => installMut.mutate({ slug: installSlug })}
-          onClose={() => { setInstallSlug(null); installMut.reset(); }}
+          onClose={() => { setInstallSlug(null); setKeyValues({}); installMut.reset(); }}
           isInstalling={installMut.isPending}
           installError={installMut.error?.message}
         />

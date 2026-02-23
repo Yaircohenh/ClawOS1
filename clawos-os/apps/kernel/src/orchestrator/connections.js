@@ -14,6 +14,19 @@ function getKey(db) {
 }
 
 /**
+ * Encrypt a plain JS object into the same AES-256-GCM base64 format used by connections.
+ */
+export function encryptSecret(db, obj) {
+  const key = getKey(db);
+  if (!key) { throw new Error("connections_key not initialised"); }
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(obj), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ciphertext]).toString("base64");
+}
+
+/**
  * Decrypt a raw encrypted_json blob from the connections table.
  * Returns the parsed secrets object, or throws if the key is missing / AEAD fails.
  */

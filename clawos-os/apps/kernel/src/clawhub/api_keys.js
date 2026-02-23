@@ -3,7 +3,7 @@
  * getKeyLinks(skillMd) → [{ envVar, label, url }]
  */
 
-const KEY_LINKS = {
+export const KEY_LINKS = {
   ANTHROPIC_API_KEY:    { label: "Anthropic API Key",              url: "https://console.anthropic.com/settings/keys" },
   OPENAI_API_KEY:       { label: "OpenAI API Key",                 url: "https://platform.openai.com/api-keys" },
   GEMINI_API_KEY:       { label: "Google Gemini API Key",          url: "https://aistudio.google.com/app/apikey" },

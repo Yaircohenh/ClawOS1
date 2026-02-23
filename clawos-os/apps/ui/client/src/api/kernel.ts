@@ -198,6 +198,16 @@ export interface BuildResult {
   scriptFilename: string;
 }
 
+export interface SkillKey {
+  envVar: string;
+  label: string;
+  url: string;
+  requiredBy: string[];
+  configured: boolean;
+  maskedValue: string | null;
+  updatedAt: string | null;
+}
+
 // ── API functions ─────────────────────────────────────────────────────────────
 
 export const kernelApi = {
@@ -255,8 +265,8 @@ export const kernelApi = {
       get<{ ok: boolean; skills: ClawhubSkill[] }>("/clawhub/search", { q, limit }),
     getSkill: (slug: string) =>
       get<ClawhubSkillDetailResponse>(`/clawhub/skill/${encodeURIComponent(slug)}`),
-    install: (slug: string, acceptDisclaimer: boolean) =>
-      post<{ ok: boolean; slug: string }>("/clawhub/install", { slug, acceptDisclaimer }),
+    install: (slug: string, acceptDisclaimer: boolean, envVars?: Record<string, string>) =>
+      post<{ ok: boolean; slug: string }>("/clawhub/install", { slug, acceptDisclaimer, envVars }),
     uninstall: (slug: string) =>
       del<{ ok: boolean; slug: string }>(`/clawhub/install/${encodeURIComponent(slug)}`),
     listInstalled: () =>
@@ -267,5 +277,11 @@ export const kernelApi = {
       post<BuildResult>("/clawhub/build", { description }),
     activate: (data: BuildResult & { description?: string }) =>
       post<{ ok: boolean; slug: string }>("/clawhub/activate", data),
+    getSkillKeys: () =>
+      get<{ ok: boolean; keys: SkillKey[] }>("/clawhub/skill_keys"),
+    updateSkillKey: (envVar: string, value: string) =>
+      patch<{ ok: boolean; envVar: string }>(`/clawhub/skill_keys/${encodeURIComponent(envVar)}`, { value }),
+    deleteSkillKey: (envVar: string) =>
+      del<{ ok: boolean; envVar: string }>(`/clawhub/skill_keys/${encodeURIComponent(envVar)}`),
   },
 };
