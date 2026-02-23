@@ -1408,14 +1408,33 @@ async function _getSkillEnv() {
 function _matchSkills(text, skills) {
   const lower = text.toLowerCase();
   return skills.filter((s) => {
-    const slug = (s.slug || "").toLowerCase().replace(/-/g, " ");
+    const slug = (s.slug || "").toLowerCase();
     const name = (s.display_name || "").toLowerCase();
-    return (
-      lower.includes(slug) ||
-      lower.includes(name) ||
-      // also match hyphenated slug directly
-      lower.includes((s.slug || "").toLowerCase())
-    );
+    // Exact matches
+    if (lower.includes(slug)) {
+      return true;
+    }
+    if (lower.includes(name)) {
+      return true;
+    }
+    if (lower.includes(slug.replace(/-/g, " "))) {
+      return true;
+    }
+    // Bigram: any 2 consecutive slug words (length > 2) appear in message
+    const slugWords = slug.split("-").filter((w) => w.length > 2);
+    for (let i = 0; i < slugWords.length - 1; i++) {
+      if (lower.includes(`${slugWords[i]} ${slugWords[i + 1]}`)) {
+        return true;
+      }
+    }
+    // Bigram on display_name words
+    const nameWords = name.split(/\s+/).filter((w) => w.length > 2);
+    for (let i = 0; i < nameWords.length - 1; i++) {
+      if (lower.includes(`${nameWords[i]} ${nameWords[i + 1]}`)) {
+        return true;
+      }
+    }
+    return false;
   });
 }
 
