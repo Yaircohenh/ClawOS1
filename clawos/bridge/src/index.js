@@ -85,6 +85,7 @@ function dbgFooter(t) {
   return (
     `\n\n[dbg msg=${t.msg_id ?? "?"} ws=…${ws} sess=…${sess} ` +
     (t.intent ? `intent=${t.intent}(${t.intent_confidence?.toFixed(2) ?? "?"}) ` : "") +
+    (t.split ? `split=true ` : "") +
     `route=${t.router_decision ?? "?"} ` +
     `provider=${t.provider ?? "?"} model=${t.model ?? "?"} ` +
     `found=${t.provider_found ?? "?"} fallback=${t.fallback_used ?? false} ` +
@@ -92,6 +93,38 @@ function dbgFooter(t) {
     (attSummary ? ` attempts=${attSummary}` : "") +
     `]`
   );
+}
+
+// ── Multi-intent heuristic splitter ──────────────────────────────────────────
+/**
+ * Extract a conversational sub-question from a multi-intent message.
+ * Runs as a fallback when classify_intent returns single-intent but the raw
+ * text contains detectable "and also …" / trailing question patterns.
+ *
+ * Returns the conversational text, or null if none detected.
+ */
+function extractConversationalTail(text) {
+  // "and also answer: ..." / "also answer: ..." / "also calculate: ..."
+  const m1 = text.match(
+    /\b(?:and\s+)?also\s+(?:answer|tell\s+me|calculate|compute|solve|note|say)\s*[:-]\s*(.+)$/is,
+  );
+  if (m1?.[1]?.trim().length >= 2) {
+    return m1[1].trim();
+  }
+
+  // "and also: ..." / "also: ..."
+  const m2 = text.match(/\b(?:and\s+)?also\s*:\s*(.+)$/is);
+  if (m2?.[1]?.trim().length >= 2) {
+    return m2[1].trim();
+  }
+
+  // "and what is ..." / "and how much ..." / "and who is ..." etc.
+  const m3 = text.match(/\band\s+(?:also\s+)?(?:what|how|why|who|when|where)\s+.{5,}$/is);
+  if (m3) {
+    return m3[0].replace(/^\band\s+(?:also\s+)?/, "").trim();
+  }
+
+  return null;
 }
 
 // Regex: user message must match to allow web_search routing (strict gating).
@@ -1165,10 +1198,11 @@ async function handleSendEmail(
   objectiveId = null,
   objectiveGoal = "",
   trace = null,
+  convText = null, // conversational sub-question extracted from multi-intent message
 ) {
   if (trace) {
     trace.router_decision = "send_email";
-    trace.tools_planned = "send_email";
+    trace.tools_planned = convText ? "send_email+chat_llm" : "send_email";
   }
 
   // ── Capability check: SMTP must be configured ──────────────────────────────
@@ -1176,7 +1210,7 @@ async function handleSendEmail(
     const conns = await kernelConnections();
     const smtpStatus = conns?.connections?.smtp?.status ?? "disconnected";
     if (smtpStatus !== "connected") {
-      const msg =
+      const smtpGuide =
         "*Email not configured*\n\n" +
         "To send emails I need your SMTP settings. " +
         "Go to *Settings → Connections → SMTP* and add:\n" +
@@ -1185,11 +1219,40 @@ async function handleSendEmail(
         "• Username (your email address)\n" +
         "• Password (or App Password for Gmail)\n\n" +
         "_Once configured, send the same email request again._";
+
+      // ── Also answer any conversational sub-question ─────────────────────────
+      // Use classify_intent's extracted text first, then fall back to heuristic.
+      // This ensures the user's conversational part is never silently dropped.
+      const tail = convText ?? extractConversationalTail(originalQuery);
+      let chatAnswer = null;
+      if (tail) {
+        try {
+          const chatRes = await submitActionRequest(workspaceId, sender, "chat_llm", {
+            message: tail,
+            ...(contextSummary ? { context_summary: contextSummary } : {}),
+          });
+          chatAnswer = chatRes?.exec?.result?.reply ?? null;
+        } catch (err) {
+          app.log.warn({ err, tail }, "multi-intent chat_llm failed — non-fatal");
+        }
+      }
+
       if (trace) {
         trace.provider = "none";
         trace.provider_found = false;
+        trace.split = tail !== null;
+        if (chatAnswer) {
+          trace.tools_planned = "send_email(blocked)+chat_llm";
+        }
       }
-      await sendWhatsApp(sender, msg + dbgFooter(trace));
+
+      app.log.info(
+        { sender, smtp_status: smtpStatus, conv_tail: tail, chat_answered: chatAnswer !== null },
+        "send_email: smtp not configured",
+      );
+
+      const combined = smtpGuide + (chatAnswer ? `\n\n---\n*Also:* ${chatAnswer}` : "");
+      await sendWhatsApp(sender, combined + dbgFooter(trace));
       return;
     }
   } catch (err) {
@@ -1258,9 +1321,13 @@ async function routeMessage(
         "classified",
       );
       if (trace) {
-        trace.intent = classified.action_type;
+        // For multi-intent, show all intents joined: "send_email+none"
+        trace.intent = classified.multi_intent
+          ? classified.intents.map((i) => i.action_type).join("+")
+          : classified.action_type;
         trace.intent_confidence = classified.confidence;
-        trace.router_decision = classified.action_type;
+        trace.split = classified.multi_intent === true;
+        trace.router_decision = classified.action_type; // primary intent drives routing
         trace.reason = classified.reasoning ?? classified.mode ?? null;
         trace.tools_planned = classified.action_type;
       }
@@ -1348,6 +1415,15 @@ async function routeMessage(
     }
 
     if (action_type === "send_email" && confidence >= CONFIDENCE.send_email) {
+      // Extract conversational sub-text: prefer classify_intent intents[] (structured),
+      // fall back to heuristic regex on raw message text.
+      const convText = classified.multi_intent
+        ? (classified.intents?.find((i) => i.action_type === "none")?.params?.text ?? null)
+        : extractConversationalTail(text);
+      if (trace && convText) {
+        trace.split = true;
+        trace.tools_planned = "send_email+chat_llm";
+      }
       await handleSendEmail(
         sender,
         params,
@@ -1358,6 +1434,7 @@ async function routeMessage(
         objectiveId,
         objectiveGoal,
         trace,
+        convText,
       );
       return;
     }
@@ -1480,6 +1557,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     objective_id: null,
     intent: null, // classify_intent result (before routing decision)
     intent_confidence: null, // classify_intent confidence score
+    split: false, // true when multiple intents detected in one message
     router_decision: null,
     reason: null,
     provider: null,
@@ -1598,6 +1676,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
       objective_id: trace.objective_id,
       intent: trace.intent,
       intent_confidence: trace.intent_confidence,
+      split: trace.split ?? false,
       router_decision: trace.router_decision,
       provider: trace.provider,
       provider_found: trace.provider_found,
