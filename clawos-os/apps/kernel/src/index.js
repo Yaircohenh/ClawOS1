@@ -20,6 +20,7 @@ import { verifyTask }                                                  from "./v
 import { registerClawhubRoutes }                                       from "./clawhub/routes.js";
 import { registerSessionRoutes }                                       from "./sessions/routes.js";
 import { registerObjectiveRoutes }                                     from "./objectives/routes.js";
+import { registerJobRoutes }                                           from "./jobs/routes.js";
 
 const PORT = Number(process.env.KERNEL_PORT || 18888);
 const DB_PATH = process.env.DB_PATH || "./kernel.db";
@@ -270,6 +271,24 @@ CREATE TABLE IF NOT EXISTS session_turns (
 );
 CREATE INDEX IF NOT EXISTS idx_session_turns
   ON session_turns(session_id, created_at DESC);
+
+-- ── Background Jobs ─────────────────────────────────────────────────────────
+-- Long-running tasks spawned asynchronously; results posted back via WhatsApp.
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id       TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  remote_jid   TEXT NOT NULL,
+  objective    TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'queued',  -- queued/running/done/failed
+  progress     TEXT NOT NULL DEFAULT '',
+  result       TEXT NOT NULL DEFAULT '',
+  error        TEXT NOT NULL DEFAULT '',
+  plan_json    TEXT NOT NULL DEFAULT '[]',
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_jid_status
+  ON jobs(workspace_id, remote_jid, status);
 `);
 
 // ── Safe schema migrations (additive, idempotent) ─────────────────────────────
@@ -298,6 +317,7 @@ CREATE INDEX IF NOT EXISTS idx_session_turns
     { action_type: "interpret_result",  mode: "auto" },
     { action_type: "cognitive_execute", mode: "auto" },
     { action_type: "chat_llm",          mode: "auto" },
+    { action_type: "plan_message",      mode: "auto" },
     { action_type: "write_file",        mode: "ask"  },
     { action_type: "run_shell",         mode: "ask"  },
     { action_type: "send_email",        mode: "ask"  },
@@ -1558,6 +1578,11 @@ registerSessionRoutes(app, db);
 // Cognitive Objective routes
 // --------------------
 registerObjectiveRoutes(app, db);
+
+// --------------------
+// Jobs routes
+// --------------------
+registerJobRoutes(app, db);
 
 // --------------------
 void app.listen({ port: PORT, host: "0.0.0.0" });

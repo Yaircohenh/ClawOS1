@@ -12,6 +12,7 @@ import { action as classifyIntent }   from "./actions/classify_intent.js";
 import { action as interpretResult }  from "./actions/interpret_result.js";
 import { action as cognitiveExecute } from "./actions/cognitive_execute.js";
 import { action as chatLlm }          from "./actions/chat_llm.js";
+import { action as planMessage }      from "./actions/plan_message.js";
 
 const registry = new Map([
   ["send_email",        sendEmail],
@@ -24,6 +25,7 @@ const registry = new Map([
   ["interpret_result",  interpretResult],
   ["cognitive_execute", cognitiveExecute],
   ["chat_llm",          chatLlm],
+  ["plan_message",      planMessage],
 ]);
 
 // Fix #1+2: verify DB-issued cap tokens; db is passed in from the kernel route
