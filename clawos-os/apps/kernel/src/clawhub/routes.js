@@ -173,12 +173,28 @@ export function registerClawhubRoutes(app, db) {
   });
 
   // ── GET /kernel/clawhub/installed ──────────────────────────────────────────
-  app.get("/kernel/clawhub/installed", async () => {
-    const rows = db.prepare(`
-      SELECT slug, display_name, version, installed_at, enabled, source, build_prompt
-      FROM installed_skills ORDER BY installed_at DESC
-    `).all();
+  app.get("/kernel/clawhub/installed", async (req) => {
+    const includeMd = req.query.include_md === "1";
+    const cols = includeMd
+      ? "slug, display_name, version, installed_at, enabled, source, build_prompt, skill_md"
+      : "slug, display_name, version, installed_at, enabled, source, build_prompt";
+    const rows = db.prepare(`SELECT ${cols} FROM installed_skills ORDER BY installed_at DESC`).all();
     return { ok: true, skills: rows };
+  });
+
+  // ── GET /kernel/clawhub/skill_env_export ───────────────────────────────────
+  // Returns decrypted skill env vars for trusted local callers (bridge).
+  // Never expose this to external networks.
+  app.get("/kernel/clawhub/skill_env_export", async () => {
+    const rows = db.prepare(`SELECT env_var, encrypted FROM skill_env_vars`).all();
+    const env = {};
+    for (const row of rows) {
+      try {
+        const plain = decryptSecret(db, row.encrypted);
+        if (plain?.value) {env[row.env_var] = plain.value;}
+      } catch { /* skip corrupted rows */ }
+    }
+    return { ok: true, env };
   });
 
   // ── PATCH /kernel/clawhub/installed/:slug { enabled: bool } ────────────────

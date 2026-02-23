@@ -13,8 +13,12 @@ export const action = {
     const command = req.payload?.command ?? req.payload?.cmd ?? "";
     if (!command) { throw new Error("payload.command is required"); }
 
+    // Caller may supply extra env vars (e.g. skill API keys) to inject
+    const extraEnv = (req.payload?.env && typeof req.payload.env === "object")
+      ? req.payload.env : {};
+
     const { stdout, stderr, code } = await new Promise((resolve) => {
-      exec(command, { timeout: TIMEOUT_MS, shell: "/bin/sh" }, (err, stdout, stderr) => {
+      exec(command, { timeout: TIMEOUT_MS, shell: "/bin/sh", env: { ...process.env, ...extraEnv } }, (err, stdout, stderr) => {
         resolve({
           stdout: stdout?.slice(0, MAX_OUTPUT) ?? "",
           stderr: stderr?.slice(0, MAX_OUTPUT) ?? "",
