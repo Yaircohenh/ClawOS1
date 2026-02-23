@@ -335,6 +335,61 @@ export async function kernelCognitivePhase(workspaceId, agentId, phase, payload)
 }
 
 /**
+ * Call plan_message to extract a plan from a user message.
+ * Returns { steps: PlanStep[], mode: 'llm'|'fallback' }
+ */
+export async function kernelPlanMessage(workspaceId, agentId, text, contextSummary = "") {
+  return post("/kernel/action_requests", {
+    workspace_id: workspaceId,
+    agent_id: agentId,
+    action_type: "plan_message",
+    payload: {
+      text,
+      ...(contextSummary ? { context_summary: contextSummary } : {}),
+    },
+  });
+}
+
+// ── Job API ────────────────────────────────────────────────────────────────────
+
+/**
+ * Create a background job.
+ * Returns { ok, job_id, status, created_at }
+ */
+export async function kernelCreateJob(workspaceId, remoteJid, objective, plan = []) {
+  return post("/kernel/jobs", {
+    workspace_id: workspaceId,
+    remote_jid: remoteJid,
+    objective,
+    plan,
+  });
+}
+
+/**
+ * Get job status + result.
+ * Returns { ok, job: { job_id, status, progress, result, error, ... } }
+ */
+export async function kernelGetJob(jobId, workspaceId) {
+  return get(`/kernel/jobs/${jobId}?workspace_id=${encodeURIComponent(workspaceId)}`);
+}
+
+/**
+ * Update job progress / result / status (called by bridge job runner).
+ */
+export async function kernelUpdateJob(jobId, workspaceId, updates) {
+  return patch(`/kernel/jobs/${jobId}`, { workspace_id: workspaceId, ...updates });
+}
+
+/**
+ * List jobs for a sender.
+ */
+export async function kernelListJobs(workspaceId, remoteJid) {
+  return get(
+    `/kernel/jobs?workspace_id=${encodeURIComponent(workspaceId)}&remote_jid=${encodeURIComponent(remoteJid)}`,
+  );
+}
+
+/**
  * Append a turn to a session's working-memory store (last-3 turns).
  */
 export async function kernelAddSessionTurn(

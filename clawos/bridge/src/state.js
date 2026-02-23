@@ -107,3 +107,28 @@ export function clearSenderPending(sender) {
   delete senderPending[sender];
   persist("sender_pending.json", senderPending);
 }
+
+// ── Session pointers (deterministic, not LLM-derived) ─────────────────────────
+// Tracks last proposed/pending action for "go ahead" / "cancel" UX.
+// Shape: {
+//   last_pending_approval_id:         string | null
+//   last_proposed_action_request_id:  string | null
+//   last_proposed_command:            string | null   (run_shell command text)
+//   last_proposed_action_type:        string | null
+//   updated_at:                       number          (epoch ms)
+// }
+let sessionPointers = load("session_pointers.json", {});
+
+export function getSessionPointers(sender) {
+  return sessionPointers[sender] ?? null;
+}
+
+export function setSessionPointers(sender, ptrs) {
+  sessionPointers[sender] = { ...ptrs, updated_at: Date.now() };
+  persist("session_pointers.json", sessionPointers);
+}
+
+export function clearSessionPointers(sender) {
+  delete sessionPointers[sender];
+  persist("session_pointers.json", sessionPointers);
+}

@@ -17,6 +17,13 @@
  */
 import Fastify from "fastify";
 import {
+  evalArithmetic,
+  formatArithResult,
+  normalizeApproval,
+  planStageA,
+  isLongTask,
+} from "./fastpath.js";
+import {
   createWorkspace,
   submitActionRequest,
   approveActionRequest,
@@ -38,6 +45,10 @@ import {
   kernelAddToolEvidence,
   kernelCognitivePhase,
   kernelAddSessionTurn,
+  kernelPlanMessage,
+  kernelCreateJob,
+  kernelUpdateJob,
+  kernelListJobs,
 } from "./kernel.js";
 import { extractPdfText } from "./pdf.js";
 import {
@@ -52,6 +63,9 @@ import {
   getSenderPending,
   setSenderPending,
   clearSenderPending,
+  getSessionPointers,
+  setSessionPointers,
+  clearSessionPointers,
 } from "./state.js";
 
 const PORT = Number(process.env.BRIDGE_PORT ?? 18790);
@@ -84,9 +98,11 @@ function dbgFooter(t) {
       : null;
   return (
     `\n\n[dbg msg=${t.msg_id ?? "?"} ws=…${ws} sess=…${sess} ` +
+    `route=${t.router_decision ?? "?"} ` +
+    (t.plan_summary ? `plan=${t.plan_summary} ` : "") +
+    (t.handler_file ? `handler=${t.handler_file} ` : "") +
     (t.intent ? `intent=${t.intent}(${t.intent_confidence?.toFixed(2) ?? "?"}) ` : "") +
     (t.split ? `split=true ` : "") +
-    `route=${t.router_decision ?? "?"} ` +
     `provider=${t.provider ?? "?"} model=${t.model ?? "?"} ` +
     `found=${t.provider_found ?? "?"} fallback=${t.fallback_used ?? false} ` +
     `blocked=${t.policy_blocked ?? false}` +
@@ -95,41 +111,45 @@ function dbgFooter(t) {
   );
 }
 
-// ── Multi-intent heuristic splitter ──────────────────────────────────────────
+// ── Responder — buffered-or-direct reply sink ─────────────────────────────────
 /**
- * Extract a conversational sub-question from a multi-intent message.
- * Runs as a fallback when classify_intent returns single-intent but the raw
- * text contains detectable "and also …" / trailing question patterns.
+ * Abstraction that either sends to WhatsApp immediately (normal mode) or
+ * collects parts so the plan executor can merge them into a single reply.
  *
- * Returns the conversational text, or null if none detected.
+ * Usage:
+ *   const r = new Responder(sender, buffered);
+ *   r.collect(text);      // called by each handler with its result
+ *   await r.flush(footer); // called once by plan executor
  */
-function extractConversationalTail(text) {
-  // "and also answer: ..." / "also answer: ..." / "also calculate: ..."
-  const m1 = text.match(
-    /\b(?:and\s+)?also\s+(?:answer|tell\s+me|calculate|compute|solve|note|say)\s*[:-]\s*(.+)$/is,
-  );
-  if (m1?.[1]?.trim().length >= 2) {
-    return m1[1].trim();
+class Responder {
+  constructor(sender, buffered = false) {
+    this._sender = sender;
+    this._buffered = buffered;
+    this._parts = [];
+  }
+  get buffered() {
+    return this._buffered;
   }
 
-  // "and also: ..." / "also: ..."
-  const m2 = text.match(/\b(?:and\s+)?also\s*:\s*(.+)$/is);
-  if (m2?.[1]?.trim().length >= 2) {
-    return m2[1].trim();
+  /** Store a result fragment (text must be non-empty to be included). */
+  collect(text) {
+    if (text) {
+      this._parts.push(text);
+    }
   }
 
-  // "and what is ..." / "and how much ..." / "and who is ..." etc.
-  const m3 = text.match(/\band\s+(?:also\s+)?(?:what|how|why|who|when|where)\s+.{5,}$/is);
-  if (m3) {
-    return m3[0].replace(/^\band\s+(?:also\s+)?/, "").trim();
+  /**
+   * Flush buffered parts (or the single collected part) as one WhatsApp message.
+   * In buffered mode parts are joined by a divider; in normal mode they are sent
+   * as-is (the single collected result from the handler that was already built).
+   */
+  async flush(footer = "") {
+    const merged = this._parts.filter(Boolean).join("\n\n---\n\n");
+    if (merged || footer) {
+      await sendWhatsApp(this._sender, merged + footer);
+    }
   }
-
-  return null;
 }
-
-// Regex: user message must match to allow web_search routing (strict gating).
-const SEARCH_EXPLICIT_RE =
-  /\b(search|find|look\s*up|google|research|browse|what\s+is|who\s+is|how\s+(do|does|to|come)|tell\s+me\s+about|explain|describe|latest|news|current|recent|price|when\s+(did|was|is|will)|where\s+(is|can)|why\s+(is|does|did)|information\s+about|meaning\s+of|definition\s+of|show\s+me|get\s+me)\b/i;
 
 // ── Authentication ────────────────────────────────────────────────────────────
 app.addHook("onRequest", (req, reply, done) => {
@@ -395,6 +415,7 @@ async function routeViaAgent(
   objectiveId = null,
   objectiveGoal = "",
   trace = null,
+  responder = null,
 ) {
   const meta = ACTION_META[actionType] ?? ACTION_META.web_search;
   const input = buildWorkerInput(actionType, params);
@@ -464,7 +485,7 @@ async function routeViaAgent(
     return;
   }
 
-  // 3b. Approval required — store DCT pending and ask user
+  // 3b. Approval required — store DCT pending, update session pointers, ask user
   if (dctRes.needs_approval) {
     const pendingData = {
       pending_type: "dct_approval",
@@ -488,6 +509,13 @@ async function routeViaAgent(
       objective_goal: objectiveGoal,
     };
     setSenderPending(sender, pendingData);
+    // ── Update deterministic session pointers ────────────────────────────────
+    setSessionPointers(sender, {
+      last_pending_approval_id: dctRes.dar_id,
+      last_proposed_action_request_id: taskId,
+      last_proposed_command: actionType === "run_shell" ? (params?.command ?? null) : null,
+      last_proposed_action_type: actionType,
+    });
     await sendWhatsApp(sender, buildApprovalMessage(pendingData));
     app.log.info(
       {
@@ -514,6 +542,7 @@ async function routeViaAgent(
     sessionId,
     objectiveId,
     trace,
+    responder,
   );
 }
 
@@ -541,6 +570,7 @@ async function _executeSubagent(
   sessionId = null,
   objectiveId = null,
   trace = null,
+  responder = null,
 ) {
   let runRes;
   try {
@@ -696,7 +726,11 @@ async function _executeSubagent(
   }
 
   // ── 6. Send final output ───────────────────────────────────────────────────
-  await sendWhatsApp(sender, friendly + dbgFooter(trace));
+  if (responder) {
+    responder.collect(friendly); // buffered — plan executor flushes with footer
+  } else {
+    await sendWhatsApp(sender, friendly + dbgFooter(trace));
+  }
   app.log.info(
     {
       sender,
@@ -732,6 +766,7 @@ async function _executeSubagent(
 function clearPending(sender, approvalId) {
   removePendingApproval(approvalId);
   clearSenderPending(sender);
+  clearSessionPointers(sender);
 }
 
 // ── !approve handler (full flow: approve → issue token → retry) ───────────────
@@ -827,6 +862,7 @@ async function handleDCTApprove(sender, sp) {
     }
 
     clearSenderPending(sender);
+    clearSessionPointers(sender);
 
     // 3. Run the subagent with the freshly minted DCT
     const input = buildWorkerInput(sp.action_type, sp.payload);
@@ -979,6 +1015,7 @@ async function handleRun(
   objectiveId = null,
   objectiveGoal = "",
   trace = null,
+  responder = null,
 ) {
   await routeViaAgent(
     sender,
@@ -991,6 +1028,7 @@ async function handleRun(
     objectiveId,
     objectiveGoal,
     trace,
+    responder,
   );
 }
 
@@ -1036,6 +1074,7 @@ async function handleWebSearch(
   objectiveId = null,
   objectiveGoal = "",
   trace = null,
+  responder = null,
 ) {
   await routeViaAgent(
     sender,
@@ -1048,6 +1087,7 @@ async function handleWebSearch(
     objectiveId,
     objectiveGoal,
     trace,
+    responder,
   );
 }
 
@@ -1063,6 +1103,7 @@ async function handleDirectAction(
   objectiveId = null,
   objectiveGoal = "",
   trace = null,
+  responder = null,
 ) {
   await routeViaAgent(
     sender,
@@ -1075,6 +1116,7 @@ async function handleDirectAction(
     objectiveId,
     objectiveGoal,
     trace,
+    responder,
   );
 }
 
@@ -1089,6 +1131,7 @@ async function handleChatLLM(
   contextSummary = "",
   objectiveId = null,
   trace = null,
+  responder = null,
 ) {
   let res;
   try {
@@ -1163,7 +1206,11 @@ async function handleChatLLM(
     "chat_llm response",
   );
 
-  await sendWhatsApp(sender, reply + dbgFooter(trace));
+  if (responder) {
+    responder.collect(reply); // buffered — plan executor flushes with footer
+  } else {
+    await sendWhatsApp(sender, reply + dbgFooter(trace));
+  }
 
   // Update session context + turns
   if (sessionId) {
@@ -1198,11 +1245,11 @@ async function handleSendEmail(
   objectiveId = null,
   objectiveGoal = "",
   trace = null,
-  convText = null, // conversational sub-question extracted from multi-intent message
+  responder = null,
 ) {
   if (trace) {
     trace.router_decision = "send_email";
-    trace.tools_planned = convText ? "send_email+chat_llm" : "send_email";
+    trace.tools_planned = "send_email";
   }
 
   // ── Capability check: SMTP must be configured ──────────────────────────────
@@ -1220,39 +1267,18 @@ async function handleSendEmail(
         "• Password (or App Password for Gmail)\n\n" +
         "_Once configured, send the same email request again._";
 
-      // ── Also answer any conversational sub-question ─────────────────────────
-      // Use classify_intent's extracted text first, then fall back to heuristic.
-      // This ensures the user's conversational part is never silently dropped.
-      const tail = convText ?? extractConversationalTail(originalQuery);
-      let chatAnswer = null;
-      if (tail) {
-        try {
-          const chatRes = await submitActionRequest(workspaceId, sender, "chat_llm", {
-            message: tail,
-            ...(contextSummary ? { context_summary: contextSummary } : {}),
-          });
-          chatAnswer = chatRes?.exec?.result?.reply ?? null;
-        } catch (err) {
-          app.log.warn({ err, tail }, "multi-intent chat_llm failed — non-fatal");
-        }
-      }
-
       if (trace) {
         trace.provider = "none";
         trace.provider_found = false;
-        trace.split = tail !== null;
-        if (chatAnswer) {
-          trace.tools_planned = "send_email(blocked)+chat_llm";
-        }
       }
 
-      app.log.info(
-        { sender, smtp_status: smtpStatus, conv_tail: tail, chat_answered: chatAnswer !== null },
-        "send_email: smtp not configured",
-      );
+      app.log.info({ sender, smtp_status: smtpStatus }, "send_email: smtp not configured");
 
-      const combined = smtpGuide + (chatAnswer ? `\n\n---\n*Also:* ${chatAnswer}` : "");
-      await sendWhatsApp(sender, combined + dbgFooter(trace));
+      if (responder) {
+        responder.collect(smtpGuide); // buffered mode — plan executor flushes
+      } else {
+        await sendWhatsApp(sender, smtpGuide + dbgFooter(trace));
+      }
       return;
     }
   } catch (err) {
@@ -1271,13 +1297,182 @@ async function handleSendEmail(
     objectiveId,
     objectiveGoal,
     trace,
+    responder,
   );
 }
 
-// ── NL Router: classify → dispatch ───────────────────────────────────────────
-// Confidence thresholds — conservative to avoid accidental shell execution
-const CONFIDENCE = { run_shell: 0.7, write_file: 0.75, read_file: 0.7, send_email: 0.75 };
+// ── Phase 3: Background job runner ───────────────────────────────────────────
 
+/**
+ * Spawn a background job and immediately reply with job ID.
+ * Returns true if job was spawned, false if kernelCreateJob failed.
+ */
+async function _spawnBackgroundJob(sender, workspaceId, text, sessionId, contextSummary) {
+  let jobId;
+  try {
+    const jobRes = await kernelCreateJob(workspaceId, sender, text, []);
+    jobId = jobRes.job_id;
+  } catch (err) {
+    app.log.error({ err, sender }, "_spawnBackgroundJob: kernelCreateJob failed");
+    return false;
+  }
+
+  await sendWhatsApp(
+    sender,
+    `Starting background task...\nJob ID: \`${jobId.slice(-12)}\`\n\nI'll message you when it's done. Send *status* to check progress.`,
+  ).catch(() => {});
+  app.log.info({ sender, jobId, objective: text.slice(0, 80) }, "background job spawned");
+
+  // Run worker asynchronously — do NOT await
+  _runJobWorker(sender, workspaceId, jobId, text, sessionId, contextSummary).catch((err) => {
+    app.log.error({ err, sender, jobId }, "background job worker failed");
+    kernelUpdateJob(jobId, workspaceId, { status: "failed", error: err.message }).catch(() => {});
+    sendWhatsApp(
+      sender,
+      `Background task failed: ${err.message}\nJob: \`${jobId.slice(-12)}\``,
+    ).catch(() => {});
+  });
+
+  return true;
+}
+
+/** Worker that runs the job and posts result back to WhatsApp. */
+async function _runJobWorker(sender, workspaceId, jobId, objective, sessionId, contextSummary) {
+  await kernelUpdateJob(jobId, workspaceId, { status: "running", progress: "Processing…" }).catch(
+    () => {},
+  );
+
+  const res = await submitActionRequest(workspaceId, sender, "chat_llm", {
+    message: objective,
+    ...(contextSummary ? { context_summary: contextSummary } : {}),
+  });
+  const result = res?.exec?.result?.reply ?? "Task completed.";
+
+  await kernelUpdateJob(jobId, workspaceId, {
+    status: "done",
+    result,
+    progress: "Completed",
+  }).catch(() => {});
+
+  await sendWhatsApp(sender, `*Task complete* (Job: \`${jobId.slice(-12)}\`)\n\n${result}`);
+}
+
+// ── Single router: Stage A → plan_message → executePlan ──────────────────────
+
+/**
+ * Execute a plan produced by planStageA or kernelPlanMessage.
+ *
+ * - Sorts steps by priority.
+ * - For 1-step plans:  Responder is unbuffered → result sent directly by handler.
+ * - For N-step plans:  Responder is buffered   → parts merged into ONE reply.
+ *
+ * Approval prompts are always sent immediately (they bypass the responder).
+ */
+async function executePlan(
+  sender,
+  steps,
+  originalText,
+  workspaceId,
+  sessionId,
+  contextSummary,
+  objectiveId,
+  objectiveGoal,
+  trace,
+) {
+  const sorted = [...steps].toSorted((a, b) => (a.priority ?? 1) - (b.priority ?? 1));
+  const responder = new Responder(sender, sorted.length > 1);
+
+  for (const step of sorted) {
+    if (step.type === "chat") {
+      const txt = step.args?.text ?? originalText;
+      await handleChatLLM(
+        sender,
+        txt,
+        workspaceId,
+        sessionId,
+        contextSummary,
+        objectiveId,
+        trace,
+        responder,
+      );
+    } else if (step.type === "action") {
+      const actionType = step.name;
+      if (!ACTION_META[actionType]) {
+        app.log.warn({ actionType }, "executePlan: unknown action type — skipping step");
+        continue;
+      }
+      const params = step.args ?? {};
+      switch (actionType) {
+        case "run_shell":
+          await handleRun(
+            sender,
+            params.command ?? originalText,
+            workspaceId,
+            originalText,
+            sessionId,
+            contextSummary,
+            objectiveId,
+            objectiveGoal,
+            trace,
+            responder,
+          );
+          break;
+        case "web_search":
+          await handleWebSearch(
+            sender,
+            params.q ?? originalText,
+            workspaceId,
+            originalText,
+            sessionId,
+            contextSummary,
+            objectiveId,
+            objectiveGoal,
+            trace,
+            responder,
+          );
+          break;
+        case "send_email":
+          await handleSendEmail(
+            sender,
+            params,
+            workspaceId,
+            originalText,
+            sessionId,
+            contextSummary,
+            objectiveId,
+            objectiveGoal,
+            trace,
+            responder,
+          );
+          break;
+        default:
+          await handleDirectAction(
+            sender,
+            actionType,
+            params,
+            workspaceId,
+            originalText,
+            sessionId,
+            contextSummary,
+            objectiveId,
+            objectiveGoal,
+            trace,
+            responder,
+          );
+      }
+    }
+  }
+
+  // Flush: merges buffered parts (multi-step) or flushes the single collected part
+  // with the debug footer appended once.
+  await responder.flush(dbgFooter(trace));
+}
+
+/**
+ * Single-router: Stage A → plan_message → executePlan
+ *
+ * classify_intent is NOT called here; all routing decisions come from the planner.
+ */
 async function routeMessage(
   sender,
   text,
@@ -1292,188 +1487,221 @@ async function routeMessage(
     trace.agent_id = sender;
   }
 
-  // Build classify payload with session + objective context for pronoun resolution
-  const classifyPayload = { text };
   const cogContext = [
     objectiveGoal ? `Objective: ${objectiveGoal}` : "",
     contextSummary ? `Session context: ${contextSummary}` : "",
   ]
     .filter(Boolean)
     .join("\n");
-  if (cogContext) {
-    classifyPayload.context_summary = cogContext;
-  }
 
-  let classified = null;
-  try {
-    const cls = await submitActionRequest(workspaceId, sender, "classify_intent", classifyPayload);
-    if (cls.ok && cls.exec?.result) {
-      classified = cls.exec.result;
-      app.log.info(
-        {
-          sender,
-          action_type: classified.action_type,
-          confidence: classified.confidence,
-          mode: classified.mode,
-          session_id: sessionId,
-          objective_id: objectiveId,
-        },
-        "classified",
-      );
-      if (trace) {
-        // For multi-intent, show all intents joined: "send_email+none"
-        trace.intent = classified.multi_intent
-          ? classified.intents.map((i) => i.action_type).join("+")
-          : classified.action_type;
-        trace.intent_confidence = classified.confidence;
-        trace.split = classified.multi_intent === true;
-        trace.router_decision = classified.action_type; // primary intent drives routing
-        trace.reason = classified.reasoning ?? classified.mode ?? null;
-        trace.tools_planned = classified.action_type;
+  // ── Stage A: deterministic planner (sub-ms, no I/O) ──────────────────────
+  let plan = planStageA(text);
+  let planMode = plan ? "stage_a" : null;
+
+  // ── Stage B: LLM planner (plan_message kernel action) ────────────────────
+  if (!plan) {
+    try {
+      const planRes = await kernelPlanMessage(workspaceId, sender, text, cogContext || "");
+      if (
+        planRes.ok &&
+        Array.isArray(planRes.exec?.result?.steps) &&
+        planRes.exec.result.steps.length > 0
+      ) {
+        plan = planRes.exec.result.steps;
+        planMode = planRes.exec.result.mode ?? "llm";
+        app.log.info(
+          { sender, steps: plan.length, mode: planMode, session_id: sessionId },
+          "plan resolved",
+        );
       }
+    } catch (err) {
+      app.log.warn({ err, sender }, "plan_message failed — using chat fallback");
     }
-  } catch (err) {
-    // Do NOT silently fall back — surface the classify failure
-    app.log.error({ err, sender }, "classify_intent failed");
-    if (trace) {
-      trace.router_decision = "classify_failed";
-      trace.fallback_used = true;
-    }
-    await sendWhatsApp(
-      sender,
-      `Could not classify your request: ${err.message}.\nPlease try rephrasing or check your API key in Settings → Connections.`,
-    );
-    return;
   }
 
-  if (classified) {
-    const { action_type, params, confidence } = classified;
-
-    if (action_type === "run_shell" && confidence >= CONFIDENCE.run_shell) {
-      const command = params?.command ?? text;
-      await handleRun(
-        sender,
-        command,
-        workspaceId,
-        text,
-        sessionId,
-        contextSummary,
-        objectiveId,
-        objectiveGoal,
-        trace,
-      );
-      return;
-    }
-
-    if (action_type === "write_file" && confidence >= CONFIDENCE.write_file) {
-      await handleDirectAction(
-        sender,
-        "write_file",
-        params,
-        workspaceId,
-        text,
-        sessionId,
-        contextSummary,
-        objectiveId,
-        objectiveGoal,
-        trace,
-      );
-      return;
-    }
-
-    if (action_type === "read_file" && confidence >= CONFIDENCE.read_file) {
-      await handleDirectAction(
-        sender,
-        "read_file",
-        params,
-        workspaceId,
-        text,
-        sessionId,
-        contextSummary,
-        objectiveId,
-        objectiveGoal,
-        trace,
-      );
-      return;
-    }
-
-    // web_search: strict gating — only proceed if user explicitly asked to search
-    if (action_type === "web_search" && SEARCH_EXPLICIT_RE.test(text)) {
-      const query = params?.q ?? text;
-      await handleWebSearch(
-        sender,
-        query,
-        workspaceId,
-        text,
-        sessionId,
-        contextSummary,
-        objectiveId,
-        objectiveGoal,
-        trace,
-      );
-      return;
-    }
-
-    if (action_type === "send_email" && confidence >= CONFIDENCE.send_email) {
-      // Extract conversational sub-text: prefer classify_intent intents[] (structured),
-      // fall back to heuristic regex on raw message text.
-      const convText = classified.multi_intent
-        ? (classified.intents?.find((i) => i.action_type === "none")?.params?.text ?? null)
-        : extractConversationalTail(text);
-      if (trace && convText) {
-        trace.split = true;
-        trace.tools_planned = "send_email+chat_llm";
-      }
-      await handleSendEmail(
-        sender,
-        params,
-        workspaceId,
-        text,
-        sessionId,
-        contextSummary,
-        objectiveId,
-        objectiveGoal,
-        trace,
-        convText,
-      );
-      return;
-    }
-
-    // No specific tool intent — route to chat LLM (default conversational path)
-    if (trace) {
-      trace.router_decision = "chat_llm";
-      trace.fallback_used = false;
-    }
-    await handleChatLLM(sender, text, workspaceId, sessionId, contextSummary, objectiveId, trace);
-    return;
+  // ── Stage C: fallback single chat step ────────────────────────────────────
+  if (!plan || plan.length === 0) {
+    plan = [{ type: "chat", args: { text }, priority: 1, can_run_in_background: false }];
+    planMode = "fallback";
   }
 
-  // classify_intent returned no result (empty exec) — treat as conversational
   if (trace) {
-    trace.router_decision = "chat_llm";
-    trace.fallback_used = false;
+    trace.plan_summary = plan.map((s) => s.name ?? s.type).join("+");
+    trace.handler_file = planMode;
+    trace.router_decision = plan[0].name ?? plan[0].type;
+    trace.split = plan.length > 1;
+    if (plan.length > 1) {
+      trace.tools_planned = trace.plan_summary;
+    }
   }
-  await handleChatLLM(sender, text, workspaceId, sessionId, contextSummary, objectiveId, trace);
+
+  app.log.info(
+    {
+      sender,
+      plan_mode: planMode,
+      plan_steps: plan.length,
+      session_id: sessionId,
+      objective_id: objectiveId,
+    },
+    "routing via plan",
+  );
+
+  await executePlan(
+    sender,
+    plan,
+    text,
+    workspaceId,
+    sessionId,
+    contextSummary,
+    objectiveId,
+    objectiveGoal,
+    trace,
+  );
 }
 
-// ── Inbound webhook ───────────────────────────────────────────────────────────
-app.post("/webhook/whatsapp", async (req, reply) => {
-  const msg = req.body ?? {};
+// ── Stale workspace detector (module-level so it can be shared) ───────────────
+function isStaleWorkspace(err) {
+  return (
+    err?.message?.includes("workspace_not_found") ||
+    err?.message?.includes("agent_not_found") ||
+    err?.message?.includes("agent_workspace_mismatch")
+  );
+}
+
+// ── Status command handler (fast path, no workspace needed) ───────────────────
+async function _handleStatusCommand(sender) {
+  const wsId = getWorkspaceId(sender);
+  if (!wsId) {
+    await sendWhatsApp(sender, "No active tasks.").catch(() => {});
+    return;
+  }
+  try {
+    const jobsRes = await kernelListJobs(wsId, sender);
+    if (!jobsRes.ok || !jobsRes.jobs?.length) {
+      await sendWhatsApp(sender, "No background tasks found.").catch(() => {});
+      return;
+    }
+    const lines = jobsRes.jobs.slice(0, 5).map((j) => {
+      const id = j.job_id.slice(-12);
+      const obj = j.objective.slice(0, 60);
+      const res = j.result ? `\n   ↳ ${j.result.slice(0, 100)}` : "";
+      return `• \`${id}\` [${j.status}] ${obj}${res}`;
+    });
+    await sendWhatsApp(sender, `*Background tasks:*\n\n${lines.join("\n\n")}`).catch(() => {});
+  } catch (err) {
+    await sendWhatsApp(sender, `Status error: ${err.message}`).catch(() => {});
+  }
+}
+
+/**
+ * Single named entry point for all inbound WhatsApp messages.
+ *
+ * Order:
+ *   1. FAST PATH   — arithmetic, approval phrases, status command (no I/O)
+ *   2. STANDARD PATH — PDF, editing state, then routeMessage (one planner)
+ *
+ * Returns { ok: true } or { ok: false, statusCode, error }.
+ */
+async function handleInboundWhatsAppMessage(msg) {
   const text = String(msg.body ?? "").trim();
   const mediaPath = msg.mediaPath ? String(msg.mediaPath) : null;
-
-  // DMs: prefer E.164; Groups: use senderJid; fallback to `from`.
   const sender = msg.senderE164 ?? msg.senderJid ?? msg.from;
 
+  // ── Validation ─────────────────────────────────────────────────────────────
   // A PDF message may have no body text — allow it through if mediaPath is set
   if ((!text && !mediaPath) || !sender) {
-    return reply.code(400).send({ error: "empty body or missing sender" });
+    return { ok: false, statusCode: 400, error: "empty body or missing sender" };
   }
 
   app.log.info(
     { sender, chatType: msg.chatType, bodyLen: text.length, hasMedia: Boolean(mediaPath) },
     "inbound",
   );
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // FAST PATH — deterministic, zero-LLM, zero-workspace-load
+  // Handles arithmetic, all approval phrases, and status queries BEFORE any I/O.
+  // ══════════════════════════════════════════════════════════════════════════
+  if (text && !mediaPath) {
+    // 0.1 Arithmetic — pure expression like "85*3" or "10 + 5 = ?"
+    const arith = evalArithmetic(text);
+    if (arith.matched) {
+      const result = formatArithResult(arith.value);
+      app.log.info({ sender, expr: text, result }, "fast_path:arithmetic");
+      await sendWhatsApp(sender, result).catch(() => {});
+      return { ok: true };
+    }
+
+    // 0.2 Approval phrases + go_ahead + cancel
+    const ap = normalizeApproval(text);
+
+    if (ap === "cancel") {
+      const had = getSenderPending(sender);
+      clearSenderPending(sender);
+      clearSessionPointers(sender);
+      app.log.info({ sender }, "fast_path:cancel");
+      await sendWhatsApp(sender, had ? "Cancelled." : "Nothing to cancel.").catch(() => {});
+      return { ok: true };
+    }
+
+    if (ap === "go_ahead") {
+      const sp = getSenderPending(sender);
+      const ptrs = getSessionPointers(sender);
+      if (sp) {
+        app.log.info({ sender, action_type: sp.action_type }, "fast_path:go_ahead→yes");
+        await handleYes(sender).catch((err) =>
+          app.log.error({ err, sender }, "go_ahead→yes failed"),
+        );
+      } else if (ptrs?.last_proposed_action_type) {
+        app.log.info({ sender, ptrs }, "fast_path:go_ahead (no pending)");
+        await sendWhatsApp(sender, "No pending action to confirm. Send me a new request.").catch(
+          () => {},
+        );
+      } else {
+        await sendWhatsApp(sender, "No pending action to run.").catch(() => {});
+      }
+      return { ok: true };
+    }
+
+    if (ap === "yes") {
+      const senderState = getSenderPending(sender);
+      if (!senderState?.editing) {
+        // In edit mode "yes" falls through; otherwise approve pending
+        app.log.info({ sender }, "fast_path:yes");
+        await handleYes(sender).catch((err) => app.log.error({ err, sender }, "handleYes failed"));
+        return { ok: true };
+      }
+    }
+
+    if (ap === "no") {
+      app.log.info({ sender }, "fast_path:no");
+      await handleNo(sender).catch((err) => app.log.error({ err, sender }, "handleNo failed"));
+      return { ok: true };
+    }
+
+    if (ap === "more") {
+      app.log.info({ sender }, "fast_path:more");
+      await handleMore(sender).catch((err) => app.log.error({ err, sender }, "handleMore failed"));
+      return { ok: true };
+    }
+
+    if (ap === "edit") {
+      app.log.info({ sender }, "fast_path:edit");
+      await handleEdit(sender).catch((err) => app.log.error({ err, sender }, "handleEdit failed"));
+      return { ok: true };
+    }
+
+    // 0.3 Status command — check background job progress
+    if (/^(status|jobs?)$/i.test(text.trim())) {
+      app.log.info({ sender }, "fast_path:status");
+      await _handleStatusCommand(sender);
+      return { ok: true };
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // STANDARD PATH — requires workspace + session
+  // ══════════════════════════════════════════════════════════════════════════
 
   // ── PDF / document ────────────────────────────────────────────────────────
   if (mediaPath && (mediaPath.endsWith(".pdf") || String(msg.mimeType ?? "").includes("pdf"))) {
@@ -1482,7 +1710,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
       wsId = await ensureWorkspace(sender);
     } catch (err) {
       await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
-      return reply.code(500).send({ error: "workspace_error" });
+      return { ok: false, statusCode: 500, error: "workspace_error" };
     }
     await handleDocument(sender, msg, wsId).catch((err) => {
       app.log.error({ err, sender, mediaPath }, "handleDocument failed");
@@ -1491,23 +1719,15 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     return { ok: true };
   }
 
-  // ── Check if sender is in "editing" state ─────────────────────────────────
+  // ── Editing state: user sent replacement text ─────────────────────────────
   const senderState = getSenderPending(sender);
   if (senderState?.editing) {
-    // "no" cancels editing too
-    const normalized = text.toLowerCase().trim();
-    if (normalized === "no") {
-      await handleNo(sender).catch((err) =>
-        app.log.error({ err, sender }, "handleNo (from edit) failed"),
-      );
-      return { ok: true };
-    }
     let wsId;
     try {
       wsId = await ensureWorkspace(sender);
     } catch (err) {
       await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
-      return reply.code(500).send({ error: "workspace_error" });
+      return { ok: false, statusCode: 500, error: "workspace_error" };
     }
     await handleEditInput(sender, text, wsId).catch((err) => {
       app.log.error({ err, sender }, "handleEditInput failed");
@@ -1516,38 +1736,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     return { ok: true };
   }
 
-  // ── Natural-language approval keywords ───────────────────────────────────
-  const normalized = text.toLowerCase().trim();
-
-  if (normalized === "yes" || normalized === "y") {
-    await handleYes(sender).catch((err) => app.log.error({ err, sender }, "handleYes failed"));
-    return { ok: true };
-  }
-
-  if (normalized === "no" || normalized === "n") {
-    await handleNo(sender).catch((err) => app.log.error({ err, sender }, "handleNo failed"));
-    return { ok: true };
-  }
-
-  if (normalized === "more" || normalized === "more info" || normalized === "more information") {
-    await handleMore(sender).catch((err) => app.log.error({ err, sender }, "handleMore failed"));
-    return { ok: true };
-  }
-
-  if (normalized === "edit") {
-    await handleEdit(sender).catch((err) => app.log.error({ err, sender }, "handleEdit failed"));
-    return { ok: true };
-  }
-
-  // ── Route message through intent classifier ───────────────────────────────
-  // Wrapped in a one-shot retry: if any kernel call returns workspace_not_found
-  // the stale workspace is cleared and the whole routing block runs again with
-  // a fresh workspace.  This makes kernel DB resets transparent to the user.
-  const isStaleWorkspace = (err) =>
-    err?.message?.includes("workspace_not_found") ||
-    err?.message?.includes("agent_not_found") ||
-    err?.message?.includes("agent_workspace_mismatch");
-
+  // ── Standard routing — single router, one planner, one reply ─────────────
   // Per-request debug trace — populated as routing proceeds, emitted at end.
   const trace = {
     msg_id: newMsgId(),
@@ -1555,13 +1744,15 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     remoteJid: sender,
     session_id: null,
     objective_id: null,
-    intent: null, // classify_intent result (before routing decision)
-    intent_confidence: null, // classify_intent confidence score
-    split: false, // true when multiple intents detected in one message
+    intent: null,
+    intent_confidence: null,
+    split: false,
+    plan_summary: null,
+    handler_file: null,
     router_decision: null,
     reason: null,
     provider: null,
-    provider_found: null, // true = provider had a key and replied; false = failed or missing
+    provider_found: null,
     policy_blocked: false,
     provider_attempts: [],
     model: null,
@@ -1570,11 +1761,12 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     agent_id: sender,
   };
 
-  const runRouting = async () => {
+  // One-shot stale-workspace retry wrapper
+  const runStandardRouting = async () => {
     const wsId = await ensureWorkspace(sender);
     trace.workspace_id = wsId;
 
-    // ── Resolve (or create) session for this sender ─────────────────────────
+    // ── Resolve (or create) session ──────────────────────────────────────────
     let sessionId = null;
     let contextSummary = "";
     try {
@@ -1594,11 +1786,11 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     } catch (err) {
       if (isStaleWorkspace(err)) {
         throw err;
-      } // bubble up for retry
+      }
       app.log.warn({ err, sender }, "kernelResolveSession failed — continuing without session");
     }
 
-    // ── Resolve (or continue) cognitive objective ──────────────────────────
+    // ── Resolve (or continue) cognitive objective ────────────────────────────
     let objectiveId = null;
     let objectiveGoal = "";
     if (sessionId) {
@@ -1630,6 +1822,16 @@ app.post("/webhook/whatsapp", async (req, reply) => {
       }
     }
 
+    // ── Phase D: Long-task detection → background job ────────────────────────
+    // Only applies to text messages; skip for media (PDF handled separately).
+    if (text && isLongTask(text)) {
+      const spawned = await _spawnBackgroundJob(sender, wsId, text, sessionId, contextSummary);
+      if (spawned) {
+        return;
+      } // job queued; immediate reply already sent
+    }
+
+    // ── Single router: planMessage → dispatch ────────────────────────────────
     await routeMessage(
       sender,
       text,
@@ -1643,30 +1845,26 @@ app.post("/webhook/whatsapp", async (req, reply) => {
   };
 
   try {
-    await runRouting();
+    await runStandardRouting();
   } catch (err) {
     if (isStaleWorkspace(err)) {
-      app.log.warn(
-        { sender, err: err.message },
-        "stale workspace mid-routing — resetting and retrying",
-      );
+      app.log.warn({ sender, err: err.message }, "stale workspace — resetting and retrying");
       try {
         await resetAndEnsureAgent(sender);
-        await runRouting();
+        await runStandardRouting();
       } catch (retryErr) {
         app.log.error({ retryErr, sender }, "routing retry failed");
         await sendWhatsApp(sender, `Bridge error: ${retryErr.message}`).catch(() => {});
-        return reply.code(500).send({ error: "route_failed" });
+        return { ok: false, statusCode: 500, error: "route_failed" };
       }
     } else {
       app.log.error({ err, sender }, "routeMessage failed");
       await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
-      return reply.code(500).send({ error: "route_failed" });
+      return { ok: false, statusCode: 500, error: "route_failed" };
     }
   }
 
-  // ── Structured trace log — emitted for EVERY inbound message (not DEBUG-only)
-  // One line per message; all routing decisions, provider info, session IDs.
+  // ── Structured trace log ──────────────────────────────────────────────────
   app.log.info(
     {
       msg_id: trace.msg_id,
@@ -1674,10 +1872,12 @@ app.post("/webhook/whatsapp", async (req, reply) => {
       remoteJid: trace.remoteJid,
       session_id: trace.session_id,
       objective_id: trace.objective_id,
+      route: trace.router_decision,
+      handler_file: trace.handler_file,
+      plan_summary: trace.plan_summary,
       intent: trace.intent,
       intent_confidence: trace.intent_confidence,
       split: trace.split ?? false,
-      router_decision: trace.router_decision,
       provider: trace.provider,
       provider_found: trace.provider_found,
       policy_blocked: trace.policy_blocked ?? false,
@@ -1689,6 +1889,18 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     "msg_trace",
   );
 
+  return { ok: true };
+}
+
+// ── Inbound webhook (thin wrapper) ────────────────────────────────────────────
+app.post("/webhook/whatsapp", async (req, reply) => {
+  const result = await handleInboundWhatsAppMessage(req.body ?? {}).catch((err) => {
+    app.log.error({ err }, "handleInboundWhatsAppMessage threw unexpectedly");
+    return { ok: false, statusCode: 500, error: err.message };
+  });
+  if (!result.ok) {
+    return reply.code(result.statusCode ?? 500).send({ error: result.error });
+  }
   return { ok: true };
 });
 
