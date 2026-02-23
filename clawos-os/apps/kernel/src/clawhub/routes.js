@@ -3,13 +3,41 @@
  * Registered by apps/kernel/src/index.js via registerClawhubRoutes(app, db).
  */
 
-import { searchSkills, exploreSkills, getSkill as hubGetSkill } from "./service.js";
+import { searchSkills, exploreSkills, getSkill as hubGetSkill, getSkillFile } from "./service.js";
 import { vetSkillMd } from "./vetting.js";
 import { buildSkill } from "./builder.js";
 import { getKeyLinks } from "./api_keys.js";
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+/**
+ * Normalize a raw ClaWHub skill record (camelCase, nested stats) to our flat shape.
+ * Works for both explore items and search results.
+ */
+function normalizeSkill(raw) {
+  return {
+    slug:         raw.slug,
+    display_name: raw.displayName || raw.display_name || raw.slug,
+    summary:      raw.summary || raw.description || "",
+    version:      raw.version || raw.tags?.latest || raw.latestVersion?.version || "1.0.0",
+    stars:        raw.stats?.stars,
+    installs:     raw.stats?.installsCurrent ?? raw.stats?.installsAllTime,
+    moderation:   raw.moderation ?? {},
+  };
+}
+
+/**
+ * Fetch the SKILL.md for a slug; returns empty string on any failure.
+ */
+async function fetchSkillMd(slug) {
+  try {
+    const text = await getSkillFile(slug, "SKILL.md");
+    return typeof text === "string" ? text : "";
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -24,7 +52,9 @@ export function registerClawhubRoutes(app, db) {
     const limit = Math.min(Number(req.query.limit) || 24, 100);
     try {
       const data = await exploreSkills(sort, limit);
-      return { ok: true, ...data };
+      // ClaWHub returns { items: [...] }
+      const raw = data.items || data.skills || [];
+      return { ok: true, skills: raw.map(normalizeSkill) };
     } catch (e) {
       reply.code(502);
       return { ok: false, error: "clawhub_unavailable", message: e.message };
@@ -38,7 +68,9 @@ export function registerClawhubRoutes(app, db) {
     if (!q) { reply.code(400); return { ok: false, error: "q_required" }; }
     try {
       const data = await searchSkills(q, limit);
-      return { ok: true, ...data };
+      // ClaWHub returns { results: [...] }
+      const raw = data.results || data.items || data.skills || [];
+      return { ok: true, skills: raw.map(normalizeSkill) };
     } catch (e) {
       reply.code(502);
       return { ok: false, error: "clawhub_unavailable", message: e.message };
@@ -48,10 +80,16 @@ export function registerClawhubRoutes(app, db) {
   // ── GET /kernel/clawhub/skill/:slug ────────────────────────────────────────
   app.get("/kernel/clawhub/skill/:slug", async (req, reply) => {
     try {
-      const skill   = await hubGetSkill(req.params.slug);
-      const skillMd = skill.skill_md || "";
-      const vetting     = vetSkillMd(skillMd, skill.moderation ?? {});
+      const raw = await hubGetSkill(req.params.slug);
+      // ClaWHub returns { skill: {slug, displayName, stats, ...}, latestVersion, owner, moderation }
+      const inner      = raw.skill || raw;
+      const moderation = raw.moderation ?? inner.moderation ?? {};
+
+      const skillMd      = await fetchSkillMd(req.params.slug);
+      const skill        = normalizeSkill({ ...inner, moderation });
+      const vetting      = vetSkillMd(skillMd, moderation);
       const requiredKeys = getKeyLinks(skillMd);
+
       return { ok: true, skill, vetting, requiredKeys };
     } catch (e) {
       reply.code(502);
@@ -66,14 +104,18 @@ export function registerClawhubRoutes(app, db) {
     if (!acceptDisclaimer) { reply.code(400); return { ok: false, error: "must_accept_disclaimer" }; }
 
     try {
-      const skill   = await hubGetSkill(slug);
-      const skillMd = skill.skill_md || "";
-      const vetting = vetSkillMd(skillMd, skill.moderation ?? {});
+      const raw        = await hubGetSkill(slug);
+      const inner      = raw.skill || raw;
+      const moderation = raw.moderation ?? inner.moderation ?? {};
+      const skillMd    = await fetchSkillMd(slug);
+      const vetting    = vetSkillMd(skillMd, moderation);
 
       if (!vetting.safe) {
         reply.code(422);
         return { ok: false, error: "vetting_failed", issues: vetting.issues };
       }
+
+      const skill = normalizeSkill({ ...inner, moderation });
 
       db.prepare(`
         INSERT INTO installed_skills (slug, display_name, version, installed_at, skill_md, vetting_json, enabled, source)
@@ -88,8 +130,8 @@ export function registerClawhubRoutes(app, db) {
           source       = 'clawhub'
       `).run(
         slug,
-        skill.display_name || skill.name || slug,
-        skill.version || "1.0.0",
+        skill.display_name,
+        skill.version,
         nowIso(),
         skillMd,
         JSON.stringify(vetting),
