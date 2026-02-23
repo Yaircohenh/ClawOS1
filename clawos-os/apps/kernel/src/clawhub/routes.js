@@ -3,7 +3,7 @@
  * Registered by apps/kernel/src/index.js via registerClawhubRoutes(app, db).
  */
 
-import { searchSkills, exploreSkills, getSkill as hubGetSkill, getSkillFile } from "./service.js";
+import { searchSkills, exploreSkills, getSkill as hubGetSkill, getSkillFile, downloadSkillScripts } from "./service.js";
 import { vetSkillMd } from "./vetting.js";
 import { buildSkill } from "./builder.js";
 import { getKeyLinks, KEY_LINKS } from "./api_keys.js";
@@ -157,6 +157,11 @@ export function registerClawhubRoutes(app, db) {
 
       // Save any provided env vars to the global skill_env_vars store
       _saveEnvVars(db, envVars);
+
+      // Download skill scripts to ~/.codex/skills/{slug}/scripts/ (non-fatal)
+      downloadSkillScripts(slug, skillMd).catch((e) =>
+        console.warn(`[clawhub] downloadSkillScripts failed for ${slug}:`, e.message),
+      );
 
       return { ok: true, slug };
     } catch (e) {
