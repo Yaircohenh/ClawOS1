@@ -1,15 +1,18 @@
 /**
  * classify_intent — Natural language → action router
  *
- * Uses Claude Haiku to classify free-form text into a kernel action type
+ * Uses Claude Haiku / Grok to classify free-form text into a kernel action type
  * and extract (or generate) the correct parameters for that action.
  *
- * Falls back to lightweight keyword heuristics when no Anthropic key is
- * configured so the bridge degrades gracefully to web_search.
+ * Falls back to lightweight keyword heuristics when no LLM key is configured.
  *
- * Return shape:
- *   { action_type, params, confidence, reasoning, mode }
- *   mode: "llm" | "heuristic"
+ * Return shape (single intent):
+ *   { action_type, params, confidence, reasoning, mode, multi_intent: false }
+ *
+ * Return shape (multi-intent — primary action + conversational sub-question):
+ *   { action_type, params, confidence, reasoning, mode, multi_intent: true,
+ *     intents: [{ action_type, params, confidence }, ...] }
+ *   intents[0] = primary (actionable), intents[1+] = secondary (conversational)
  */
 import { getSecret } from "../connections.js";
 
@@ -17,7 +20,7 @@ const ANTHROPIC_MODEL = "claude-haiku-4-5-20251001";
 const XAI_MODEL = "grok-3-mini";
 
 const SYSTEM_PROMPT = `You are a command router for a personal AI assistant.
-Classify the user message into one of these actions and produce the right parameters.
+Classify the user message into the correct action(s) and produce parameters.
 
 ACTIONS
 - web_search   : Look up information, answer questions, research topics, check prices, news.
@@ -28,35 +31,68 @@ ACTIONS
                  params: { "path": "<relative filepath>", "content": "<file content>" }
 - read_file    : Read or display a file.
                  params: { "path": "<relative filepath>" }
-- send_email   : Send an email. Use when user says "email", "send", "write to", "message" with an email address or person.
+- send_email   : Send an email. Use when user says "email", "send", "write to", "message" with an email address.
                  params: { "to": "<recipient email>", "subject": "<subject line>", "body": "<full email body>" }
-- none         : Greeting, casual chat, general question, reminder, or non-actionable message.
-                 params: {}
+- none         : Casual chat, math, factual question, general conversation, or non-actionable message.
+                 Single intent: params: {}
+                 Multi-intent (conversational slot): params: { "text": "<exact sub-question text>" }
+
+MULTI-INTENT
+When the message combines a PRIMARY actionable intent (send_email, run_shell, etc.) WITH a
+DISTINCT conversational sub-question (math, factual, casual — signaled by "and also",
+"also answer", "also:", "and what is", "and how much", trailing math expression, etc.),
+return intents[] instead of action_type:
+{"intents":[
+  {"action_type":"send_email","params":{"to":"...","subject":"...","body":"..."},"confidence":0.95},
+  {"action_type":"none","params":{"text":"10 + 5 = ?"},"confidence":0.99}
+],"reasoning":"email request plus math sub-question"}
+
+For single-purpose messages, return the standard format:
+{"action_type":"...","params":{...},"confidence":0.9,"reasoning":"one sentence"}
 
 RULES
-1. For run_shell — generate a real, runnable bash command.  Never echo the user's
-   words literally as a command. Translate intent to shell syntax.
+1. For run_shell — generate a real, runnable bash command. Never echo words as a command.
 2. For web_search — sharpen and clean the query; remove filler words.
 3. Prefer web_search over run_shell for informational questions.
 4. Only choose run_shell when the user clearly wants system-level execution.
-5. For send_email — extract the recipient email address from the message. Infer a clear
-   subject line. Draft a polite, professional email body from the user's intent. If the
-   body content is vague, produce a reasonable short draft.
+5. For send_email — extract recipient email, infer subject, draft a polite body from intent.
 6. For write_file — infer a sensible filename when not explicitly given.
-7. confidence: float 0.0–1.0 reflecting how certain you are.
+7. confidence: float 0.0–1.0 reflecting certainty.
+8. Multi-intent: put the ACTIONABLE intent FIRST in intents[]; conversational (none) last.
+9. Only use intents[] when there are genuinely 2 distinct purposes. When in doubt → standard format.
 
-Respond with ONLY a JSON object — no markdown, no explanation:
-{"action_type":"...","params":{...},"confidence":0.9,"reasoning":"one sentence"}`;
+Respond with ONLY a JSON object — no markdown, no explanation.`;
 
 // ── Shared JSON parser (handles accidental markdown fences) ───────────────────
 function parseClassifyResponse(raw) {
   const jsonStr = raw.replace(/^```(?:json)?/m, "").replace(/```$/m, "").trim();
   const parsed = JSON.parse(jsonStr);
+
+  // ── Multi-intent format: { intents: [{action_type, params, confidence}, …], reasoning }
+  if (Array.isArray(parsed.intents) && parsed.intents.length > 0) {
+    const intents = parsed.intents.map((i) => ({
+      action_type: String(i.action_type ?? "none"),
+      params:      i.params ?? {},
+      confidence:  Number(i.confidence ?? 0.5),
+    }));
+    return {
+      // Primary intent exposed at top level for backward compatibility
+      action_type:  intents[0].action_type,
+      params:       intents[0].params,
+      confidence:   intents[0].confidence,
+      reasoning:    String(parsed.reasoning ?? ""),
+      intents,
+      multi_intent: true,
+    };
+  }
+
+  // ── Single-intent format (standard) ──────────────────────────────────────────
   return {
-    action_type: String(parsed.action_type ?? "web_search"),
-    params: parsed.params ?? {},
-    confidence: Number(parsed.confidence ?? 0.5),
-    reasoning: String(parsed.reasoning ?? ""),
+    action_type:  String(parsed.action_type ?? "web_search"),
+    params:       parsed.params ?? {},
+    confidence:   Number(parsed.confidence ?? 0.5),
+    reasoning:    String(parsed.reasoning ?? ""),
+    multi_intent: false,
   };
 }
 
@@ -70,7 +106,7 @@ async function classifyWithXai(text, apiKey) {
     },
     body: JSON.stringify({
       model: XAI_MODEL,
-      max_tokens: 256,
+      max_tokens: 512,
       temperature: 0,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
@@ -99,7 +135,7 @@ async function classifyWithAnthropic(text, apiKey) {
     },
     body: JSON.stringify({
       model: ANTHROPIC_MODEL,
-      max_tokens: 256,
+      max_tokens: 512,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: text }],
     }),
