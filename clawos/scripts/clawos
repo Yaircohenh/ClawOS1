@@ -9,4 +9,151 @@ mkdir -p "${STATE_DIR}"
 export OPENCLAW_STATE_DIR="${STATE_DIR}"
 export OPENCLAW_PROFILE="clawos"
 
+# ── Built-in subcommands (handled in bash before handing off to node) ──────────
+CMD="${1:-}"
+SUB="${2:-}"
+
+if [ "$CMD" = "doctor" ] && [ "$SUB" = "whatsapp" ]; then
+  # ── clawos doctor whatsapp ────────────────────────────────────────────────────
+  # Checks that the full WhatsApp → Bridge → Kernel → LLM path is wired correctly.
+  # Prints diagnostic info without printing any secret values.
+
+  KERNEL="${KERNEL_URL:-http://localhost:18888}"
+  BRIDGE="${BRIDGE_URL:-http://localhost:18790}"
+  DB_PATH="${DB_PATH:-${REPO_ROOT}/clawos-os/apps/kernel/kernel.db}"
+  PASS=0; FAIL=0
+
+  green() { printf '\033[32m✓\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
+  red()   { printf '\033[31m✗\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
+  info()  { printf '  %s\n' "$*"; }
+
+  echo "=== ClawOS Doctor — WhatsApp Path ==="
+  echo
+
+  # 1. Kernel reachable
+  echo "── Kernel ──────────────────────────────────────────────"
+  info "URL : $KERNEL"
+  HEALTH=$(curl -sf "${KERNEL}/kernel/health" 2>/dev/null || echo "{}")
+  if [ "$(echo "$HEALTH" | jq -r '.ok' 2>/dev/null)" = "true" ]; then
+    green "kernel reachable"
+  else
+    red   "kernel not reachable at $KERNEL"
+    echo
+    echo "  Recommended fix: start the kernel —"
+    echo "    cd ${REPO_ROOT}/clawos-os && node --env-file=apps/kernel/.env apps/kernel/src/index.js"
+  fi
+
+  # 2. Kernel DB path
+  echo
+  echo "── Kernel DB ────────────────────────────────────────────"
+  info "Path: $DB_PATH"
+  if [ -f "$DB_PATH" ]; then
+    green "DB file exists"
+  else
+    red   "DB file missing: $DB_PATH"
+    echo "  Recommended fix: check DB_PATH in clawos-os/apps/kernel/.env"
+  fi
+
+  # 3. LLM provider keys
+  echo
+  echo "── LLM Providers (via kernel /connections) ──────────────"
+  CONNS=$(curl -sf "${KERNEL}/kernel/connections" 2>/dev/null || echo "{}")
+  # xAI and Anthropic are the chat LLM providers — at least one must be connected.
+  # openai is optional (not used for chat_llm currently).
+  for PROV in xai anthropic; do
+    STATUS=$(echo "$CONNS" | jq -r ".connections.${PROV}.status // \"missing\"" 2>/dev/null)
+    case "$STATUS" in
+      connected) green "$PROV : connected" ;;
+      missing)   info  "$PROV : not configured (optional — only one chat provider needed)" ;;
+      *)         info  "$PROV : $STATUS" ;;
+    esac
+  done
+
+  # Check if at least one chat provider is configured
+  XAI_OK=$(echo "$CONNS" | jq -r '.connections.xai.status // "missing"' 2>/dev/null)
+  ANTH_OK=$(echo "$CONNS" | jq -r '.connections.anthropic.status // "missing"' 2>/dev/null)
+  echo
+  if [ "$XAI_OK" = "connected" ] || [ "$ANTH_OK" = "connected" ]; then
+    green "at least one chat LLM provider configured"
+  else
+    red "NO chat LLM provider configured — bot will reply with error"
+    echo
+    echo "  Recommended fix (xAI):"
+    echo "    curl -X PUT ${KERNEL}/kernel/connections/xai \\"
+    echo "      -H 'Content-Type: application/json' \\"
+    echo "      -d '{\"api_key\":\"<your-xai-key>\"}'"
+    echo "  Or add the key via http://localhost:18887/ → Settings → Connections"
+  fi
+
+  # 4. Brave search (optional)
+  BRAVE_OK=$(echo "$CONNS" | jq -r '.connections.brave.status // "missing"' 2>/dev/null)
+  echo
+  echo "── Search Provider ──────────────────────────────────────"
+  if [ "$BRAVE_OK" = "connected" ]; then
+    green "brave : connected (web_search enabled)"
+  else
+    info  "brave : not configured (web_search will not work)"
+  fi
+
+  # 5. Bridge reachable
+  echo
+  echo "── Bridge ───────────────────────────────────────────────"
+  info "URL : $BRIDGE"
+  BHEALTH=$(curl -sf "${BRIDGE}/health" 2>/dev/null || echo "{}")
+  if [ "$(echo "$BHEALTH" | jq -r '.ok' 2>/dev/null)" = "true" ]; then
+    green "bridge reachable"
+    SEND_URL=$(echo "$BHEALTH" | jq -r '.send_url // "unknown"' 2>/dev/null)
+    info "send_url : $SEND_URL"
+  else
+    red "bridge not reachable at $BRIDGE"
+    echo "  Recommended fix: start the bridge —"
+    echo "    cd ${REPO_ROOT}/clawos/bridge && node --env-file=.env src/index.js"
+  fi
+
+  # 6. Direct chat_llm smoke test
+  echo
+  echo "── chat_llm smoke test ───────────────────────────────────"
+  WS=$(curl -sf -X POST "${KERNEL}/kernel/workspaces" \
+    -H "Content-Type: application/json" \
+    -d '{"type":"doctor_test"}' 2>/dev/null || echo "{}")
+  WS_ID=$(echo "$WS" | jq -r '.workspace_id // ""' 2>/dev/null)
+  if [ -n "$WS_ID" ] && [ "$WS_ID" != "null" ]; then
+    AGENT="doctor_agent"
+    curl -sf -X POST "${KERNEL}/kernel/agents" \
+      -H "Content-Type: application/json" \
+      -d "{\"workspace_id\":\"${WS_ID}\",\"agent_id\":\"${AGENT}\",\"role\":\"orchestrator\"}" \
+      > /dev/null 2>&1 || true
+
+    CHAT=$(curl -sf -X POST "${KERNEL}/kernel/action_requests" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"workspace_id\": \"${WS_ID}\",
+        \"agent_id\":     \"${AGENT}\",
+        \"action_type\":  \"chat_llm\",
+        \"payload\":      { \"message\": \"Reply with exactly: OK\" }
+      }" 2>/dev/null || echo "{}")
+
+    CHAT_OK=$(echo "$CHAT" | jq -r '.ok' 2>/dev/null)
+    CHAT_PROV=$(echo "$CHAT" | jq -r '.exec.result.provider // "none"' 2>/dev/null)
+    CHAT_REPLY=$(echo "$CHAT" | jq -r '.exec.result.reply // ""' 2>/dev/null)
+    CHAT_ERR=$(echo "$CHAT" | jq -r '.exec.result.error // ""' 2>/dev/null)
+
+    if [ "$CHAT_OK" = "true" ] && [ -n "$CHAT_REPLY" ]; then
+      green "chat_llm: provider=${CHAT_PROV} reply=${CHAT_REPLY}"
+    else
+      red "chat_llm: failed — provider=${CHAT_PROV} error=${CHAT_ERR}"
+      echo "  This means WhatsApp users will see an error instead of AI replies."
+    fi
+  else
+    red "could not create test workspace — kernel may be locked or down"
+  fi
+
+  echo
+  echo "========================================"
+  printf  "  Results: %d passed, %d failed\n" "$PASS" "$FAIL"
+  echo "========================================"
+  exit $FAIL
+fi
+
+# ── Default: delegate to node (OpenClaw CLI) ───────────────────────────────────
 exec node "${REPO_ROOT}/dist/index.js" "$@"

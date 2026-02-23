@@ -61,15 +61,26 @@ const DEBUG = process.env.DEBUG === "true";
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
 
 // ── Debug helpers ─────────────────────────────────────────────────────────────
-/** Build the [dbg …] footer appended to outbound messages when DEBUG=true. */
+/** Short random message ID for per-request correlation. */
+function newMsgId() {
+  return "msg_" + Math.random().toString(36).slice(2, 10);
+}
+
+/**
+ * Build the [dbg …] footer appended to outbound messages when DEBUG=true.
+ * Includes msg_id so the user can correlate a reply back to a log line.
+ */
 function dbgFooter(t) {
   if (!DEBUG || !t) {
     return "";
   }
+  const ws = t.workspace_id ? t.workspace_id.slice(-8) : "?";
+  const sess = t.session_id ? t.session_id.slice(-8) : "?";
   return (
-    `\n\n[dbg route=${t.router_decision ?? "?"} agent=${t.agent_id ?? "?"} ` +
+    `\n\n[dbg msg=${t.msg_id ?? "?"} ws=…${ws} sess=…${sess} ` +
+    `route=${t.router_decision ?? "?"} ` +
     `provider=${t.provider ?? "?"} model=${t.model ?? "?"} ` +
-    `tools=${t.tools ?? "?"} fallback=${t.fallback_used ?? false}]`
+    `found=${t.provider_found ?? "?"} fallback=${t.fallback_used ?? false}]`
   );
 }
 
@@ -1044,18 +1055,25 @@ async function handleChatLLM(
     const errMsg =
       result.error ??
       "No LLM provider configured. Add an xAI or Anthropic API key in Settings → Connections.";
-    app.log.error({ sender, errMsg }, "chat_llm: no provider");
+    // Distinguish "provider failed" (error) from "no credentials" (none)
+    const providerState = result.provider ?? "none";
+    app.log.error(
+      { sender, provider_state: providerState, configured: result.configured ?? [], errMsg },
+      "chat_llm: no reply",
+    );
     if (trace) {
-      trace.provider = "none";
+      trace.provider = providerState;
+      trace.provider_found = false;
       trace.fallback_used = true;
     }
-    await sendWhatsApp(sender, errMsg);
+    await sendWhatsApp(sender, errMsg + dbgFooter(trace));
     return;
   }
 
   if (trace) {
     trace.router_decision = "chat_llm";
     trace.provider = result.provider ?? "unknown";
+    trace.provider_found = true;
     trace.model = result.model ?? null;
     trace.tools = "chat_llm";
     trace.fallback_used = false;
@@ -1328,6 +1346,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
 
   // Per-request debug trace — populated as routing proceeds, emitted at end.
   const trace = {
+    msg_id: newMsgId(),
     workspace_id: null,
     remoteJid: sender,
     session_id: null,
@@ -1335,6 +1354,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     router_decision: null,
     reason: null,
     provider: null,
+    provider_found: null, // true = provider had a key and replied; false = failed or missing
     model: null,
     tools: null,
     fallback_used: false,
@@ -1436,24 +1456,24 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     }
   }
 
-  // ── Structured debug log (one line per inbound message) ───────────────────
-  if (DEBUG) {
-    app.log.info(
-      {
-        workspace_id: trace.workspace_id,
-        remoteJid: trace.remoteJid,
-        session_id: trace.session_id,
-        objective_id: trace.objective_id,
-        router_decision: trace.router_decision,
-        reason: trace.reason,
-        provider_target: trace.provider,
-        model: trace.model,
-        fallback_used: trace.fallback_used,
-        tools_planned: trace.tools_planned ?? trace.router_decision,
-      },
-      "dbg_inbound",
-    );
-  }
+  // ── Structured trace log — emitted for EVERY inbound message (not DEBUG-only)
+  // One line per message; all routing decisions, provider info, session IDs.
+  app.log.info(
+    {
+      msg_id: trace.msg_id,
+      workspace_id: trace.workspace_id,
+      remoteJid: trace.remoteJid,
+      session_id: trace.session_id,
+      objective_id: trace.objective_id,
+      router_decision: trace.router_decision,
+      provider: trace.provider,
+      provider_found: trace.provider_found,
+      model: trace.model,
+      fallback_used: trace.fallback_used,
+      tools_planned: trace.tools_planned ?? trace.router_decision,
+    },
+    "msg_trace",
+  );
 
   return { ok: true };
 });

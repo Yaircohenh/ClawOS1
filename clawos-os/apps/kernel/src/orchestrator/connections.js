@@ -48,3 +48,19 @@ export function getSecret(db, provider) {
     return null;
   }
 }
+
+/**
+ * Return a list of provider names that have credentials stored.
+ * Never returns keys or any secret material.
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @returns {string[]}
+ */
+export function listProviders(db) {
+  try {
+    const rows = db.prepare(`SELECT provider FROM connections`).all();
+    return rows.map((r) => r.provider);
+  } catch {
+    return [];
+  }
+}

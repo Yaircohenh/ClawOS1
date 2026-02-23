@@ -5,9 +5,11 @@
  * Calls xAI (Grok) or Anthropic directly to produce a conversational reply.
  *
  * payload: { message, context_summary? }
- * returns: { reply, provider, model } | { reply: null, provider: "none", error }
+ * returns: { reply, provider, model }
+ *        | { reply: null, provider: "error",  error: "<provider error detail>" }
+ *        | { reply: null, provider: "none",   error: "No LLM provider configured…" }
  */
-import { getSecret } from "../connections.js";
+import { getSecret, listProviders } from "../connections.js";
 
 const XAI_MODEL       = "grok-3-mini";
 const ANTHROPIC_MODEL = "claude-haiku-4-5-20251001";
@@ -39,14 +41,19 @@ async function chatWithXai(message, contextSummary, apiKey) {
       "Authorization": `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model:      XAI_MODEL,
-      max_tokens: 1024,
+      model:       XAI_MODEL,
+      max_tokens:  1024,
       temperature: 0.7,
       messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
     }),
   });
 
-  if (!r.ok) { throw new Error(`xAI returned HTTP ${r.status}`); }
+  if (!r.ok) {
+    // Read body so callers can surface the real rejection reason (e.g. safety policy)
+    let errBody = "";
+    try { errBody = await r.text(); } catch { /* ignore */ }
+    throw new Error(`xAI ${r.status}: ${errBody.slice(0, 300)}`);
+  }
   const data  = await r.json();
   const reply = data.choices?.[0]?.message?.content ?? "";
   if (!reply)  { throw new Error("xAI returned empty reply"); }
@@ -74,7 +81,11 @@ async function chatWithAnthropic(message, contextSummary, apiKey) {
     }),
   });
 
-  if (!r.ok) { throw new Error(`Anthropic returned HTTP ${r.status}`); }
+  if (!r.ok) {
+    let errBody = "";
+    try { errBody = await r.text(); } catch { /* ignore */ }
+    throw new Error(`Anthropic ${r.status}: ${errBody.slice(0, 300)}`);
+  }
   const data  = await r.json();
   const reply = data.content?.[0]?.text ?? "";
   if (!reply)  { throw new Error("Anthropic returned empty reply"); }
@@ -96,16 +107,21 @@ export const action = {
     }
     const ctxSummary = context_summary ?? null;
 
+    // ── Provider lookup with observability ────────────────────────────────────
+    let lastError  = null;  // set when a provider IS configured but throws
+    let configured = [];    // provider names that have keys
+
     if (ctx?.db) {
+      configured = listProviders(ctx.db);
+
       // Try xAI (Grok) first — preferred when configured
       const xai = getSecret(ctx.db, "xai");
       if (xai?.api_key) {
         try {
           return await chatWithXai(message, ctxSummary, xai.api_key);
         } catch (err) {
-          // Log and fall through to Anthropic (e.g. xAI safety filter, transient error)
-          const detail = err?.message ?? String(err);
-          console.warn(`[chat_llm] xAI failed (${detail}) — trying Anthropic`);
+          lastError = err;
+          console.warn(`[chat_llm] xAI failed: ${err.message}`);
         }
       }
 
@@ -115,16 +131,34 @@ export const action = {
         try {
           return await chatWithAnthropic(message, ctxSummary, anthropic.api_key);
         } catch (err) {
-          console.warn(`[chat_llm] Anthropic failed (${err?.message}) — no provider`);
+          lastError = err;
+          console.warn(`[chat_llm] Anthropic failed: ${err.message}`);
         }
       }
     }
 
-    // No LLM provider available
+    // ── Error reporting ────────────────────────────────────────────────────────
+    // Distinguish "provider configured but rejected the request" from
+    // "no provider credentials exist at all" — these must not show the same message.
+    if (lastError) {
+      // At least one provider had a key but the request failed (e.g. xAI 403 safety filter)
+      console.warn(`[chat_llm] all providers failed; configured=${configured.join(",")}`);
+      return {
+        reply:    null,
+        provider: "error",
+        model:    null,
+        configured,
+        error:    `AI provider request failed: ${lastError.message}`,
+      };
+    }
+
+    // Truly no credentials in the DB
+    console.warn(`[chat_llm] no provider configured; DB providers=${configured.join(",") || "(none)"}`);
     return {
       reply:    null,
       provider: "none",
       model:    null,
+      configured,
       error:    "No LLM provider configured. Add an xAI or Anthropic API key in Settings → Connections.",
     };
   },
