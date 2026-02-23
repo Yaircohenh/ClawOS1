@@ -23,6 +23,7 @@ import {
   denyActionRequest,
   issueToken,
   kernelHealth,
+  kernelConnections,
   registerAgent,
   kernelCreateTask,
   kernelSpawnSubagent,
@@ -83,6 +84,7 @@ function dbgFooter(t) {
       : null;
   return (
     `\n\n[dbg msg=${t.msg_id ?? "?"} ws=…${ws} sess=…${sess} ` +
+    (t.intent ? `intent=${t.intent}(${t.intent_confidence?.toFixed(2) ?? "?"}) ` : "") +
     `route=${t.router_decision ?? "?"} ` +
     `provider=${t.provider ?? "?"} model=${t.model ?? "?"} ` +
     `found=${t.provider_found ?? "?"} fallback=${t.fallback_used ?? false} ` +
@@ -315,6 +317,12 @@ const ACTION_META = {
     description: "Read a file in the workspace",
     reversible: true,
   },
+  send_email: {
+    worker: "email_sender",
+    scope: { allowed_tools: ["send_email"], operations: ["write"] },
+    description: "Send an email via your configured email account",
+    reversible: false,
+  },
 };
 
 /** Map action params to the shape the worker handler expects. */
@@ -328,6 +336,8 @@ function buildWorkerInput(actionType, params) {
       return { path: params?.path ?? "", content: params?.content ?? "" };
     case "read_file":
       return { path: params?.path ?? "" };
+    case "send_email":
+      return { to: params?.to ?? "", subject: params?.subject ?? "", body: params?.body ?? "" };
     default:
       return params ?? {};
   }
@@ -524,6 +534,16 @@ async function _executeSubagent(
       trace.fallback_used = true;
     }
     await sendWhatsApp(sender, `Web search unavailable — no search provider configured.\n${note}`);
+    return;
+  }
+
+  // send_email: surface missing SMTP config as a helpful guide rather than a generic error
+  if (actionType === "send_email" && runRes.result?.missing_connection === "smtp") {
+    const msg =
+      runRes.result.error ??
+      "SMTP not configured. Go to Settings → Connections → SMTP to add your email server details.";
+    app.log.warn({ sender }, "send_email: SMTP not configured");
+    await sendWhatsApp(sender, msg + dbgFooter(trace));
     return;
   }
 
@@ -1127,9 +1147,73 @@ async function handleChatLLM(
   }
 }
 
+// ── Email handler — capability check + agent route ────────────────────────────
+/**
+ * Pre-flight check: query kernel connections to verify SMTP is configured.
+ * If not → send a friendly setup guide. If yes → route through agent/DCT path.
+ *
+ * The approval gate (risk_level=high) is enforced by the DCT request, so the
+ * user will still need to confirm before the email is actually sent.
+ */
+async function handleSendEmail(
+  sender,
+  params,
+  workspaceId,
+  originalQuery,
+  sessionId = null,
+  contextSummary = "",
+  objectiveId = null,
+  objectiveGoal = "",
+  trace = null,
+) {
+  if (trace) {
+    trace.router_decision = "send_email";
+    trace.tools_planned = "send_email";
+  }
+
+  // ── Capability check: SMTP must be configured ──────────────────────────────
+  try {
+    const conns = await kernelConnections();
+    const smtpStatus = conns?.connections?.smtp?.status ?? "disconnected";
+    if (smtpStatus !== "connected") {
+      const msg =
+        "*Email not configured*\n\n" +
+        "To send emails I need your SMTP settings. " +
+        "Go to *Settings → Connections → SMTP* and add:\n" +
+        "• Host (e.g. smtp.gmail.com)\n" +
+        "• Port (587 for TLS, 465 for SSL)\n" +
+        "• Username (your email address)\n" +
+        "• Password (or App Password for Gmail)\n\n" +
+        "_Once configured, send the same email request again._";
+      if (trace) {
+        trace.provider = "none";
+        trace.provider_found = false;
+      }
+      await sendWhatsApp(sender, msg + dbgFooter(trace));
+      return;
+    }
+  } catch (err) {
+    app.log.warn({ err }, "kernelConnections check failed — proceeding with send_email attempt");
+  }
+
+  // SMTP is configured — route through agent/subagent/DCT (will trigger approval)
+  await handleDirectAction(
+    sender,
+    "send_email",
+    params,
+    workspaceId,
+    originalQuery,
+    sessionId,
+    contextSummary,
+    objectiveId,
+    objectiveGoal,
+    trace,
+  );
+}
+
 // ── NL Router: classify → dispatch ───────────────────────────────────────────
 // Confidence thresholds — conservative to avoid accidental shell execution
-const CONFIDENCE = { run_shell: 0.7, write_file: 0.75, read_file: 0.7 };
+const CONFIDENCE = { run_shell: 0.7, write_file: 0.75, read_file: 0.7, send_email: 0.75 };
 
 async function routeMessage(
   sender,
@@ -1174,6 +1258,8 @@ async function routeMessage(
         "classified",
       );
       if (trace) {
+        trace.intent = classified.action_type;
+        trace.intent_confidence = classified.confidence;
         trace.router_decision = classified.action_type;
         trace.reason = classified.reasoning ?? classified.mode ?? null;
         trace.tools_planned = classified.action_type;
@@ -1250,6 +1336,21 @@ async function routeMessage(
       await handleWebSearch(
         sender,
         query,
+        workspaceId,
+        text,
+        sessionId,
+        contextSummary,
+        objectiveId,
+        objectiveGoal,
+        trace,
+      );
+      return;
+    }
+
+    if (action_type === "send_email" && confidence >= CONFIDENCE.send_email) {
+      await handleSendEmail(
+        sender,
+        params,
         workspaceId,
         text,
         sessionId,
@@ -1377,6 +1478,8 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     remoteJid: sender,
     session_id: null,
     objective_id: null,
+    intent: null, // classify_intent result (before routing decision)
+    intent_confidence: null, // classify_intent confidence score
     router_decision: null,
     reason: null,
     provider: null,
@@ -1493,6 +1596,8 @@ app.post("/webhook/whatsapp", async (req, reply) => {
       remoteJid: trace.remoteJid,
       session_id: trace.session_id,
       objective_id: trace.objective_id,
+      intent: trace.intent,
+      intent_confidence: trace.intent_confidence,
       router_decision: trace.router_decision,
       provider: trace.provider,
       provider_found: trace.provider_found,

@@ -119,6 +119,14 @@ export async function kernelHealth() {
   return get("/kernel/health");
 }
 
+/**
+ * Get all configured connections and their status.
+ * Returns { connections: { smtp: { status, ... }, xai: { status, ... }, ... } }
+ */
+export async function kernelConnections() {
+  return get("/kernel/connections");
+}
+
 // ── Agent / Task / Subagent / DCT API ────────────────────────────────────────
 
 /**
