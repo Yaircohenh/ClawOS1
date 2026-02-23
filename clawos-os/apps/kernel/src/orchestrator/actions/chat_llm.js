@@ -102,7 +102,11 @@ export const action = {
       if (xai?.api_key) {
         try {
           return await chatWithXai(message, ctxSummary, xai.api_key);
-        } catch { /* fall through to Anthropic */ }
+        } catch (err) {
+          // Log and fall through to Anthropic (e.g. xAI safety filter, transient error)
+          const detail = err?.message ?? String(err);
+          console.warn(`[chat_llm] xAI failed (${detail}) — trying Anthropic`);
+        }
       }
 
       // Try Anthropic second
@@ -110,7 +114,9 @@ export const action = {
       if (anthropic?.api_key) {
         try {
           return await chatWithAnthropic(message, ctxSummary, anthropic.api_key);
-        } catch { /* fall through */ }
+        } catch (err) {
+          console.warn(`[chat_llm] Anthropic failed (${err?.message}) — no provider`);
+        }
       }
     }
 

@@ -16,6 +16,7 @@
 import { getSecret } from "../orchestrator/connections.js";
 
 const ANTHROPIC_MODEL = "claude-haiku-4-5-20251001";
+const XAI_MODEL       = "grok-3-mini";
 const MAX_CHARS = 1000;
 
 // ── Template fallback ─────────────────────────────────────────────────────────
@@ -24,59 +25,77 @@ function templateUpdate(existing, userMessage, assistantResponse, _actionType) {
   const turnsMatch = existing.match(/^TURNS:\s*(\d+)$/m);
   const prevTurns = parseInt(turnsMatch?.[1] ?? "0", 10);
 
-  // Preserve existing GOAL or derive from latest user message
-  const goalMatch = existing.match(/^GOAL:\s*(.+)$/m);
-  const goal = goalMatch?.[1] ?? userMessage.slice(0, 150);
+  // Build a compact narrative of this turn so follow-ups have real content
+  const userSnippet  = userMessage.slice(0, 150);
+  const replySnippet = assistantResponse.slice(0, 250);
 
-  // Preserve existing ENTITIES; add nothing (template can't extract reliably)
-  const entitiesMatch = existing.match(/^ENTITIES:\s*(.*)$/m);
-  const entities = entitiesMatch?.[1] ?? "";
+  // Preserve existing history, prepend latest turn
+  const existingHistory = existing.replace(/^TURNS:\s*\d+\n?/m, "").trim();
+  const thisExchange    = `[Turn ${prevTurns + 1}] User: ${userSnippet}\nAssistant: ${replySnippet}`;
 
-  // Preserve existing DECISIONS
-  const decisionsMatch = existing.match(/^DECISIONS:\s*(.*)$/m);
-  const decisions = decisionsMatch?.[1] ?? "";
-
-  // Derive PENDING from assistant response (very rough heuristic)
-  const pending = assistantResponse.includes("?") ? "follow-up question pending" : "";
+  const combined = existingHistory
+    ? `${existingHistory}\n\n${thisExchange}`
+    : thisExchange;
 
   return [
-    `GOAL: ${goal.slice(0, 200)}`,
-    `ENTITIES: ${entities.slice(0, 200)}`,
-    `DECISIONS: ${decisions.slice(0, 200)}`,
-    `PENDING: ${pending}`,
-    `TURNS: ${prevTurns + 1}`,
-  ]
-    .join("\n")
-    .slice(0, MAX_CHARS);
+    combined.slice(0, MAX_CHARS - 20),
+    `\nTURNS: ${prevTurns + 1}`,
+  ].join("").slice(0, MAX_CHARS);
 }
 
-// ── LLM-based update ──────────────────────────────────────────────────────────
-async function llmUpdate(apiKey, { existing, userMessage, assistantResponse, actionType }) {
-  const prompt =
+// ── Shared summary prompt ──────────────────────────────────────────────────────
+function buildSummaryPrompt(existing, userMessage, assistantResponse, actionType) {
+  return (
     `You are a session context tracker. Update the session summary with the latest turn.\n\n` +
     `CURRENT SUMMARY:\n${existing || "(empty)"}\n\n` +
     `LATEST TURN:\n` +
     `User: ${userMessage.slice(0, 400)}\n` +
     `Action: ${actionType}\n` +
     `Assistant: ${assistantResponse.slice(0, 400)}\n\n` +
-    `Return ONLY a summary in this exact format (total ≤ 900 chars):\n` +
-    `GOAL: <current objective in 1-2 sentences>\n` +
-    `ENTITIES: <key names, files, URLs — comma separated, max 6 items>\n` +
-    `DECISIONS: <choices made — comma separated, max 4 items>\n` +
-    `PENDING: <unanswered questions or items awaiting action — comma separated>\n` +
-    `TURNS: <total turn count as integer>`;
+    `Write a SHORT plain-text summary (≤ 900 chars) of what was discussed so far. ` +
+    `Include the key facts from the assistant's response so follow-up questions have context. ` +
+    `Do NOT output JSON or structured fields. End with "TURNS: <integer>".`
+  );
+}
+
+// ── xAI (Grok) summarizer ──────────────────────────────────────────────────────
+async function xaiUpdate(apiKey, { existing, userMessage, assistantResponse, actionType }) {
+  const prompt = buildSummaryPrompt(existing, userMessage, assistantResponse, actionType);
+
+  const r = await fetch("https://api.x.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model:       XAI_MODEL,
+      max_tokens:  350,
+      temperature: 0.2,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+
+  if (!r.ok) { throw new Error(`xAI returned HTTP ${r.status}`); }
+  const data = await r.json();
+  return (data.choices?.[0]?.message?.content ?? "").trim().slice(0, MAX_CHARS);
+}
+
+// ── Anthropic (Claude Haiku) summarizer ───────────────────────────────────────
+async function llmUpdate(apiKey, { existing, userMessage, assistantResponse, actionType }) {
+  const prompt = buildSummaryPrompt(existing, userMessage, assistantResponse, actionType);
 
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
+      "Content-Type":       "application/json",
+      "x-api-key":          apiKey,
+      "anthropic-version":  "2023-06-01",
     },
     body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
+      model:      ANTHROPIC_MODEL,
       max_tokens: 350,
-      messages: [{ role: "user", content: prompt }],
+      messages:   [{ role: "user", content: prompt }],
     }),
   });
 
@@ -106,20 +125,25 @@ export async function updateSummary(db, { existing_summary, user_message, assist
   const asstResp = String(assistant_response ?? "").slice(0, 600);
   const actType  = String(action_type ?? "");
 
-  // Try Anthropic LLM first
   if (db) {
-    const secrets = getSecret(db, "anthropic");
-    if (secrets?.api_key) {
+    // Try xAI (Grok) first — preferred when configured
+    const xaiSecrets = getSecret(db, "xai");
+    if (xaiSecrets?.api_key) {
       try {
-        return await llmUpdate(secrets.api_key, {
-          existing,
-          userMessage: userMsg,
-          assistantResponse: asstResp,
-          actionType: actType,
+        return await xaiUpdate(xaiSecrets.api_key, {
+          existing, userMessage: userMsg, assistantResponse: asstResp, actionType: actType,
         });
-      } catch {
-        // Fall through to template
-      }
+      } catch { /* fall through */ }
+    }
+
+    // Try Anthropic second
+    const anthropicSecrets = getSecret(db, "anthropic");
+    if (anthropicSecrets?.api_key) {
+      try {
+        return await llmUpdate(anthropicSecrets.api_key, {
+          existing, userMessage: userMsg, assistantResponse: asstResp, actionType: actType,
+        });
+      } catch { /* fall through */ }
     }
   }
 
