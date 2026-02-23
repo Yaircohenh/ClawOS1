@@ -297,6 +297,7 @@ CREATE INDEX IF NOT EXISTS idx_session_turns
     { action_type: "classify_intent",   mode: "auto" },
     { action_type: "interpret_result",  mode: "auto" },
     { action_type: "cognitive_execute", mode: "auto" },
+    { action_type: "chat_llm",          mode: "auto" },
     { action_type: "write_file",        mode: "ask"  },
     { action_type: "run_shell",         mode: "ask"  },
     { action_type: "send_email",        mode: "ask"  },
