@@ -1006,6 +1006,83 @@ async function handleDirectAction(
   );
 }
 
+// ── Default chat LLM handler ──────────────────────────────────────────────────
+// Called for all messages that don't match a specific tool intent.
+// Submits chat_llm directly to the kernel (no task/subagent/DCT overhead).
+async function handleChatLLM(
+  sender,
+  text,
+  workspaceId,
+  sessionId = null,
+  contextSummary = "",
+  objectiveId = null,
+  trace = null,
+) {
+  let res;
+  try {
+    res = await submitActionRequest(workspaceId, sender, "chat_llm", {
+      message: text,
+      ...(contextSummary ? { context_summary: contextSummary } : {}),
+    });
+  } catch (err) {
+    app.log.error({ err, sender }, "chat_llm: kernel request failed");
+    await sendWhatsApp(sender, `Chat error: ${err.message}`);
+    return;
+  }
+
+  if (!res.ok) {
+    const errMsg = res.error ?? JSON.stringify(res);
+    app.log.error({ sender, err: errMsg }, "chat_llm: kernel error");
+    await sendWhatsApp(sender, `Chat error: ${errMsg}`);
+    return;
+  }
+
+  const result = res.exec?.result ?? {};
+  const reply = result.reply;
+
+  if (!reply) {
+    const errMsg =
+      result.error ??
+      "No LLM provider configured. Add an xAI or Anthropic API key in Settings → Connections.";
+    app.log.error({ sender, errMsg }, "chat_llm: no provider");
+    if (trace) {
+      trace.provider = "none";
+      trace.fallback_used = true;
+    }
+    await sendWhatsApp(sender, errMsg);
+    return;
+  }
+
+  if (trace) {
+    trace.router_decision = "chat_llm";
+    trace.provider = result.provider ?? "unknown";
+    trace.model = result.model ?? null;
+    trace.tools = "chat_llm";
+    trace.fallback_used = false;
+  }
+
+  app.log.info(
+    { sender, provider: result.provider, model: result.model, reply_len: reply.length },
+    "chat_llm response",
+  );
+
+  await sendWhatsApp(sender, reply + dbgFooter(trace));
+
+  // Update session context + turns
+  if (sessionId) {
+    kernelUpdateSession(sessionId, workspaceId, text, reply, "chat_llm").catch((err) =>
+      app.log.warn({ err, session_id: sessionId }, "session update failed — non-fatal"),
+    );
+  }
+  if (objectiveId && sessionId) {
+    void kernelAddSessionTurn(objectiveId, sessionId, {
+      user_message: text,
+      assistant_response: reply,
+      action_type: "chat_llm",
+    });
+  }
+}
+
 // ── NL Router: classify → dispatch ───────────────────────────────────────────
 // Confidence thresholds — conservative to avoid accidental shell execution
 const CONFIDENCE = { run_shell: 0.7, write_file: 0.75, read_file: 0.7 };
@@ -1140,27 +1217,21 @@ async function routeMessage(
       return;
     }
 
-    // Classified as web_search but no explicit search intent, or action_type "none"
+    // No specific tool intent — route to chat LLM (default conversational path)
     if (trace) {
-      trace.router_decision = action_type;
-      trace.fallback_used = true;
+      trace.router_decision = "chat_llm";
+      trace.fallback_used = false;
     }
-    await sendWhatsApp(
-      sender,
-      `I'm not sure what you'd like me to do. Try asking me to search for something, run a command, or read a file.`,
-    );
+    await handleChatLLM(sender, text, workspaceId, sessionId, contextSummary, objectiveId, trace);
     return;
   }
 
-  // classify_intent returned no result (empty exec) — surface error, no silent fallback
+  // classify_intent returned no result (empty exec) — treat as conversational
   if (trace) {
-    trace.router_decision = "no_classification";
-    trace.fallback_used = true;
+    trace.router_decision = "chat_llm";
+    trace.fallback_used = false;
   }
-  await sendWhatsApp(
-    sender,
-    `I couldn't understand that request. Try asking me to search for something or run a command.`,
-  );
+  await handleChatLLM(sender, text, workspaceId, sessionId, contextSummary, objectiveId, trace);
 }
 
 // ── Inbound webhook ───────────────────────────────────────────────────────────
