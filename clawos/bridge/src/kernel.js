@@ -390,6 +390,21 @@ export async function kernelListJobs(workspaceId, remoteJid) {
 }
 
 /**
+ * List installed skills. Pass include_md=true to include full skill_md content.
+ */
+export async function kernelListInstalled(includeMd = false) {
+  return get(`/kernel/clawhub/installed${includeMd ? "?include_md=1" : ""}`);
+}
+
+/**
+ * Export all configured skill env vars as plaintext { env: { KEY: value } }.
+ * For trusted local use only (bridge → kernel on localhost).
+ */
+export async function kernelSkillEnvExport() {
+  return get("/kernel/clawhub/skill_env_export");
+}
+
+/**
  * Append a turn to a session's working-memory store (last-3 turns).
  */
 export async function kernelAddSessionTurn(

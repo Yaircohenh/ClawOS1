@@ -49,6 +49,8 @@ import {
   kernelCreateJob,
   kernelUpdateJob,
   kernelListJobs,
+  kernelListInstalled,
+  kernelSkillEnvExport,
 } from "./kernel.js";
 import { extractPdfText } from "./pdf.js";
 import {
@@ -1017,11 +1019,14 @@ async function handleRun(
   trace = null,
   responder = null,
 ) {
+  // Always inject configured skill env vars so skills have their API keys available
+  const skillEnv = await _getSkillEnv().catch(() => ({}));
+
   await routeViaAgent(
     sender,
     workspaceId,
     "run_shell",
-    { command },
+    { command, ...(Object.keys(skillEnv).length > 0 ? { env: skillEnv } : {}) },
     originalQuery,
     sessionId,
     contextSummary,
@@ -1357,6 +1362,92 @@ async function _runJobWorker(sender, workspaceId, jobId, objective, sessionId, c
   await sendWhatsApp(sender, `*Task complete* (Job: \`${jobId.slice(-12)}\`)\n\n${result}`);
 }
 
+// ── Skill context helpers ─────────────────────────────────────────────────────
+
+// Module-level caches — refreshed every 90s to avoid per-message fetches.
+let _skillsCache = []; // [{ slug, display_name, skill_md }]
+let _skillEnvCache = {}; // { GEMINI_API_KEY: "...", ... }
+let _skillsCacheAt = 0;
+let _skillEnvCacheAt = 0;
+const SKILL_CACHE_TTL = 90_000;
+
+async function _getInstalledSkills() {
+  const now = Date.now();
+  if (now - _skillsCacheAt < SKILL_CACHE_TTL) {
+    return _skillsCache;
+  }
+  try {
+    const res = await kernelListInstalled(true); // include_md=true
+    _skillsCache = res.skills ?? [];
+    _skillsCacheAt = now;
+  } catch {
+    /* use stale cache */
+  }
+  return _skillsCache;
+}
+
+async function _getSkillEnv() {
+  const now = Date.now();
+  if (now - _skillEnvCacheAt < SKILL_CACHE_TTL) {
+    return _skillEnvCache;
+  }
+  try {
+    const res = await kernelSkillEnvExport();
+    _skillEnvCache = res.env ?? {};
+    _skillEnvCacheAt = now;
+  } catch {
+    /* use stale cache */
+  }
+  return _skillEnvCache;
+}
+
+/**
+ * Match installed skills to a user message.
+ * Returns skills whose slug or display_name words appear in the message.
+ */
+function _matchSkills(text, skills) {
+  const lower = text.toLowerCase();
+  return skills.filter((s) => {
+    const slug = (s.slug || "").toLowerCase().replace(/-/g, " ");
+    const name = (s.display_name || "").toLowerCase();
+    return (
+      lower.includes(slug) ||
+      lower.includes(name) ||
+      // also match hyphenated slug directly
+      lower.includes((s.slug || "").toLowerCase())
+    );
+  });
+}
+
+/**
+ * Extract a brief usage snippet from a SKILL.md string.
+ * Returns the lines under the first "## Usage" heading (up to ~20 lines).
+ */
+function _extractUsage(skillMd) {
+  if (!skillMd) {
+    return "";
+  }
+  const lines = skillMd.split("\n");
+  let inUsage = false;
+  const out = [];
+  for (const line of lines) {
+    if (/^##\s+Usage/i.test(line)) {
+      inUsage = true;
+      continue;
+    }
+    if (inUsage) {
+      if (/^##\s/.test(line)) {
+        break;
+      } // next heading
+      out.push(line);
+      if (out.length >= 20) {
+        break;
+      }
+    }
+  }
+  return out.join("\n").trim();
+}
+
 // ── Single router: Stage A → plan_message → executePlan ──────────────────────
 
 /**
@@ -1501,7 +1592,26 @@ async function routeMessage(
   // ── Stage B: LLM planner (plan_message kernel action) ────────────────────
   if (!plan) {
     try {
-      const planRes = await kernelPlanMessage(workspaceId, sender, text, cogContext || "");
+      // Enrich context with installed skill usage if the message references one
+      let enrichedContext = cogContext || "";
+      try {
+        const skills = await _getInstalledSkills();
+        const matched = _matchSkills(
+          text,
+          skills.filter((s) => s.enabled !== 0),
+        );
+        if (matched.length > 0) {
+          const snippets = matched.map((s) => {
+            const usage = _extractUsage(s.skill_md);
+            return `Installed skill: ${s.display_name} (${s.slug})\nUsage:\n${usage}`;
+          });
+          enrichedContext = [enrichedContext, ...snippets].filter(Boolean).join("\n\n");
+        }
+      } catch {
+        /* non-fatal */
+      }
+
+      const planRes = await kernelPlanMessage(workspaceId, sender, text, enrichedContext);
       if (
         planRes.ok &&
         Array.isArray(planRes.exec?.result?.steps) &&
