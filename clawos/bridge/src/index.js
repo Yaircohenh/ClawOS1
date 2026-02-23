@@ -76,11 +76,19 @@ function dbgFooter(t) {
   }
   const ws = t.workspace_id ? t.workspace_id.slice(-8) : "?";
   const sess = t.session_id ? t.session_id.slice(-8) : "?";
+  // Compact attempt summary: "xai:success" or "xai:policy_block,xai_retry:success"
+  const attSummary =
+    Array.isArray(t.provider_attempts) && t.provider_attempts.length
+      ? t.provider_attempts.map((a) => `${a.provider}:${a.outcome}`).join(",")
+      : null;
   return (
     `\n\n[dbg msg=${t.msg_id ?? "?"} ws=…${ws} sess=…${sess} ` +
     `route=${t.router_decision ?? "?"} ` +
     `provider=${t.provider ?? "?"} model=${t.model ?? "?"} ` +
-    `found=${t.provider_found ?? "?"} fallback=${t.fallback_used ?? false}]`
+    `found=${t.provider_found ?? "?"} fallback=${t.fallback_used ?? false} ` +
+    `blocked=${t.policy_blocked ?? false}` +
+    (attSummary ? ` attempts=${attSummary}` : "") +
+    `]`
   );
 }
 
@@ -1055,16 +1063,24 @@ async function handleChatLLM(
     const errMsg =
       result.error ??
       "No LLM provider configured. Add an xAI or Anthropic API key in Settings → Connections.";
-    // Distinguish "provider failed" (error) from "no credentials" (none)
     const providerState = result.provider ?? "none";
     app.log.error(
-      { sender, provider_state: providerState, configured: result.configured ?? [], errMsg },
+      {
+        sender,
+        provider_state: providerState,
+        policy_blocked: result.policy_blocked ?? false,
+        configured: result.configured ?? [],
+        provider_attempts: result.provider_attempts ?? [],
+        errMsg,
+      },
       "chat_llm: no reply",
     );
     if (trace) {
       trace.provider = providerState;
       trace.provider_found = false;
-      trace.fallback_used = true;
+      trace.fallback_used = result.fallback_used ?? false;
+      trace.policy_blocked = result.policy_blocked ?? false;
+      trace.provider_attempts = result.provider_attempts ?? [];
     }
     await sendWhatsApp(sender, errMsg + dbgFooter(trace));
     return;
@@ -1076,11 +1092,21 @@ async function handleChatLLM(
     trace.provider_found = true;
     trace.model = result.model ?? null;
     trace.tools = "chat_llm";
-    trace.fallback_used = false;
+    trace.fallback_used = result.fallback_used ?? false;
+    trace.policy_blocked = result.policy_blocked ?? false;
+    trace.provider_attempts = result.provider_attempts ?? [];
   }
 
   app.log.info(
-    { sender, provider: result.provider, model: result.model, reply_len: reply.length },
+    {
+      sender,
+      provider: result.provider,
+      model: result.model,
+      reply_len: reply.length,
+      fallback_used: result.fallback_used ?? false,
+      policy_blocked: result.policy_blocked ?? false,
+      provider_attempts: result.provider_attempts ?? [],
+    },
     "chat_llm response",
   );
 
@@ -1355,6 +1381,8 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     reason: null,
     provider: null,
     provider_found: null, // true = provider had a key and replied; false = failed or missing
+    policy_blocked: false,
+    provider_attempts: [],
     model: null,
     tools: null,
     fallback_used: false,
@@ -1468,8 +1496,10 @@ app.post("/webhook/whatsapp", async (req, reply) => {
       router_decision: trace.router_decision,
       provider: trace.provider,
       provider_found: trace.provider_found,
-      model: trace.model,
+      policy_blocked: trace.policy_blocked ?? false,
       fallback_used: trace.fallback_used,
+      provider_attempts: trace.provider_attempts ?? [],
+      model: trace.model,
       tools_planned: trace.tools_planned ?? trace.router_decision,
     },
     "msg_trace",
