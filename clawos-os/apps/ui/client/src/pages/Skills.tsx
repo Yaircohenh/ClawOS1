@@ -173,15 +173,17 @@ function InstallModal({
                         {k.envVar}
                       </span>
                       <span style={{ fontSize: 12, color: "var(--muted)", flex: 1 }}>{k.label}</span>
-                      <a
-                        href={k.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="btn btn-sm"
-                        style={{ fontSize: 11 }}
-                      >
-                        Get key →
-                      </a>
+                      {k.url && (
+                        <a
+                          href={k.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="btn btn-sm"
+                          style={{ fontSize: 11 }}
+                        >
+                          Get key →
+                        </a>
+                      )}
                     </div>
                   ))}
                 </div>

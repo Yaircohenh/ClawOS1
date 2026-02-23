@@ -6,6 +6,8 @@
 const KEY_LINKS = {
   ANTHROPIC_API_KEY:    { label: "Anthropic API Key",              url: "https://console.anthropic.com/settings/keys" },
   OPENAI_API_KEY:       { label: "OpenAI API Key",                 url: "https://platform.openai.com/api-keys" },
+  GEMINI_API_KEY:       { label: "Google Gemini API Key",          url: "https://aistudio.google.com/app/apikey" },
+  GOOGLE_GEMINI_API_KEY:{ label: "Google Gemini API Key",          url: "https://aistudio.google.com/app/apikey" },
   BRAVE_API_KEY:        { label: "Brave Search API Key",           url: "https://brave.com/search/api/" },
   GITHUB_TOKEN:         { label: "GitHub Personal Access Token",   url: "https://github.com/settings/tokens" },
   NOTION_API_KEY:       { label: "Notion Integration Token",       url: "https://www.notion.so/my-integrations" },
@@ -35,9 +37,13 @@ export function getKeyLinks(skillMd) {
   const links = [];
   for (const m of matches) {
     const varName = m.replace(/^\$\{?/, "").replace(/\}$/, "");
-    if (!found.has(varName) && KEY_LINKS[varName]) {
-      found.add(varName);
+    if (found.has(varName)) {continue;}
+    found.add(varName);
+    if (KEY_LINKS[varName]) {
       links.push({ envVar: varName, ...KEY_LINKS[varName] });
+    } else if (/(?:_API_KEY|_TOKEN|_SECRET|_KEY)$/.test(varName)) {
+      // Unknown sensitive var — surface it so the user knows it's needed
+      links.push({ envVar: varName, label: "API key required by this skill", url: "" });
     }
   }
   return links;
