@@ -56,8 +56,26 @@ import {
 const PORT = Number(process.env.BRIDGE_PORT ?? 18790);
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET ?? "";
 const BRIDGE_SEND_URL = process.env.BRIDGE_SEND_URL ?? "http://localhost:18791/send";
+const DEBUG = process.env.DEBUG === "true";
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
+
+// ── Debug helpers ─────────────────────────────────────────────────────────────
+/** Build the [dbg …] footer appended to outbound messages when DEBUG=true. */
+function dbgFooter(t) {
+  if (!DEBUG || !t) {
+    return "";
+  }
+  return (
+    `\n\n[dbg route=${t.router_decision ?? "?"} agent=${t.agent_id ?? "?"} ` +
+    `provider=${t.provider ?? "?"} model=${t.model ?? "?"} ` +
+    `tools=${t.tools ?? "?"} fallback=${t.fallback_used ?? false}]`
+  );
+}
+
+// Regex: user message must match to allow web_search routing (strict gating).
+const SEARCH_EXPLICIT_RE =
+  /\b(search|find|look\s*up|google|research|browse|what\s+is|who\s+is|how\s+(do|does|to|come)|tell\s+me\s+about|explain|describe|latest|news|current|recent|price|when\s+(did|was|is|will)|where\s+(is|can)|why\s+(is|does|did)|information\s+about|meaning\s+of|definition\s+of|show\s+me|get\s+me)\b/i;
 
 // ── Authentication ────────────────────────────────────────────────────────────
 app.addHook("onRequest", (req, reply, done) => {
@@ -314,6 +332,7 @@ async function routeViaAgent(
   contextSummary = "",
   objectiveId = null,
   objectiveGoal = "",
+  trace = null,
 ) {
   const meta = ACTION_META[actionType] ?? ACTION_META.web_search;
   const input = buildWorkerInput(actionType, params);
@@ -432,6 +451,7 @@ async function routeViaAgent(
     originalQuery,
     sessionId,
     objectiveId,
+    trace,
   );
 }
 
@@ -458,6 +478,7 @@ async function _executeSubagent(
   originalQuery,
   sessionId = null,
   objectiveId = null,
+  trace = null,
 ) {
   let runRes;
   try {
@@ -471,6 +492,27 @@ async function _executeSubagent(
   if (!runRes.ok) {
     await sendWhatsApp(sender, `Kernel error: ${runRes.error ?? JSON.stringify(runRes)}`);
     return;
+  }
+
+  // ── Provider failure gate: no silent fallback ──────────────────────────────
+  // web_search returns mode="manual_research" when no Brave key is configured
+  // or the provider call fails.  Surface this as an explicit error.
+  if (actionType === "web_search" && runRes.result?.mode === "manual_research") {
+    const note = runRes.result.note ?? "Add a Brave API key in Settings → Connections.";
+    app.log.error({ sender, note }, "web_search: provider unavailable (manual_research)");
+    if (trace) {
+      trace.provider = "none";
+      trace.fallback_used = true;
+    }
+    await sendWhatsApp(sender, `Web search unavailable — no search provider configured.\n${note}`);
+    return;
+  }
+
+  // ── Populate trace with provider / model ──────────────────────────────────
+  if (trace) {
+    trace.provider = runRes.result?.mode ?? runRes.result?.provider ?? "unknown";
+    trace.model = runRes.result?.model ?? null;
+    trace.tools = actionType;
   }
 
   // ── 1. Record tool evidence ────────────────────────────────────────────────
@@ -582,7 +624,7 @@ async function _executeSubagent(
   }
 
   // ── 6. Send final output ───────────────────────────────────────────────────
-  await sendWhatsApp(sender, friendly);
+  await sendWhatsApp(sender, friendly + dbgFooter(trace));
   app.log.info(
     {
       sender,
@@ -864,6 +906,7 @@ async function handleRun(
   contextSummary = "",
   objectiveId = null,
   objectiveGoal = "",
+  trace = null,
 ) {
   await routeViaAgent(
     sender,
@@ -875,6 +918,7 @@ async function handleRun(
     contextSummary,
     objectiveId,
     objectiveGoal,
+    trace,
   );
 }
 
@@ -919,6 +963,7 @@ async function handleWebSearch(
   contextSummary = "",
   objectiveId = null,
   objectiveGoal = "",
+  trace = null,
 ) {
   await routeViaAgent(
     sender,
@@ -930,6 +975,7 @@ async function handleWebSearch(
     contextSummary,
     objectiveId,
     objectiveGoal,
+    trace,
   );
 }
 
@@ -944,6 +990,7 @@ async function handleDirectAction(
   contextSummary = "",
   objectiveId = null,
   objectiveGoal = "",
+  trace = null,
 ) {
   await routeViaAgent(
     sender,
@@ -955,6 +1002,7 @@ async function handleDirectAction(
     contextSummary,
     objectiveId,
     objectiveGoal,
+    trace,
   );
 }
 
@@ -970,7 +1018,12 @@ async function routeMessage(
   contextSummary = "",
   objectiveId = null,
   objectiveGoal = "",
+  trace = null,
 ) {
+  if (trace) {
+    trace.agent_id = sender;
+  }
+
   // Build classify payload with session + objective context for pronoun resolution
   const classifyPayload = { text };
   const cogContext = [
@@ -999,9 +1052,24 @@ async function routeMessage(
         },
         "classified",
       );
+      if (trace) {
+        trace.router_decision = classified.action_type;
+        trace.reason = classified.reasoning ?? classified.mode ?? null;
+        trace.tools_planned = classified.action_type;
+      }
     }
   } catch (err) {
-    app.log.warn({ err, sender }, "classify_intent failed — falling back to web_search");
+    // Do NOT silently fall back — surface the classify failure
+    app.log.error({ err, sender }, "classify_intent failed");
+    if (trace) {
+      trace.router_decision = "classify_failed";
+      trace.fallback_used = true;
+    }
+    await sendWhatsApp(
+      sender,
+      `Could not classify your request: ${err.message}.\nPlease try rephrasing or check your API key in Settings → Connections.`,
+    );
+    return;
   }
 
   if (classified) {
@@ -1018,6 +1086,7 @@ async function routeMessage(
         contextSummary,
         objectiveId,
         objectiveGoal,
+        trace,
       );
       return;
     }
@@ -1033,6 +1102,7 @@ async function routeMessage(
         contextSummary,
         objectiveId,
         objectiveGoal,
+        trace,
       );
       return;
     }
@@ -1048,35 +1118,48 @@ async function routeMessage(
         contextSummary,
         objectiveId,
         objectiveGoal,
+        trace,
       );
       return;
     }
 
-    // web_search, none, or below-threshold confidence → web_search fallback
-    const query = params?.q ?? text;
-    await handleWebSearch(
+    // web_search: strict gating — only proceed if user explicitly asked to search
+    if (action_type === "web_search" && SEARCH_EXPLICIT_RE.test(text)) {
+      const query = params?.q ?? text;
+      await handleWebSearch(
+        sender,
+        query,
+        workspaceId,
+        text,
+        sessionId,
+        contextSummary,
+        objectiveId,
+        objectiveGoal,
+        trace,
+      );
+      return;
+    }
+
+    // Classified as web_search but no explicit search intent, or action_type "none"
+    if (trace) {
+      trace.router_decision = action_type;
+      trace.fallback_used = true;
+    }
+    await sendWhatsApp(
       sender,
-      query,
-      workspaceId,
-      text,
-      sessionId,
-      contextSummary,
-      objectiveId,
-      objectiveGoal,
+      `I'm not sure what you'd like me to do. Try asking me to search for something, run a command, or read a file.`,
     );
     return;
   }
 
-  // Classification unavailable — fall back to web_search
-  await handleWebSearch(
+  // classify_intent returned no result (empty exec) — surface error, no silent fallback
+  if (trace) {
+    trace.router_decision = "no_classification";
+    trace.fallback_used = true;
+  }
+  await sendWhatsApp(
     sender,
-    text,
-    workspaceId,
-    text,
-    sessionId,
-    contextSummary,
-    objectiveId,
-    objectiveGoal,
+    `I couldn't understand that request. Try asking me to search for something or run a command.`,
   );
 }
 
@@ -1172,8 +1255,24 @@ app.post("/webhook/whatsapp", async (req, reply) => {
     err?.message?.includes("agent_not_found") ||
     err?.message?.includes("agent_workspace_mismatch");
 
+  // Per-request debug trace — populated as routing proceeds, emitted at end.
+  const trace = {
+    workspace_id: null,
+    remoteJid: sender,
+    session_id: null,
+    objective_id: null,
+    router_decision: null,
+    reason: null,
+    provider: null,
+    model: null,
+    tools: null,
+    fallback_used: false,
+    agent_id: sender,
+  };
+
   const runRouting = async () => {
     const wsId = await ensureWorkspace(sender);
+    trace.workspace_id = wsId;
 
     // ── Resolve (or create) session for this sender ─────────────────────────
     let sessionId = null;
@@ -1182,6 +1281,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
       const sessionRes = await kernelResolveSession(wsId, "whatsapp", sender, text);
       sessionId = sessionRes.session_id ?? null;
       contextSummary = sessionRes.session?.context_summary ?? "";
+      trace.session_id = sessionId;
       app.log.info(
         { sender, session_id: sessionId, decision: sessionRes.decision, reason: sessionRes.reason },
         "session resolved",
@@ -1207,6 +1307,7 @@ app.post("/webhook/whatsapp", async (req, reply) => {
         if (objRes.ok) {
           objectiveId = objRes.objective_id ?? null;
           objectiveGoal = objRes.goal ?? "";
+          trace.objective_id = objectiveId;
           app.log.info(
             {
               sender,
@@ -1229,7 +1330,16 @@ app.post("/webhook/whatsapp", async (req, reply) => {
       }
     }
 
-    await routeMessage(sender, text, wsId, sessionId, contextSummary, objectiveId, objectiveGoal);
+    await routeMessage(
+      sender,
+      text,
+      wsId,
+      sessionId,
+      contextSummary,
+      objectiveId,
+      objectiveGoal,
+      trace,
+    );
   };
 
   try {
@@ -1253,6 +1363,25 @@ app.post("/webhook/whatsapp", async (req, reply) => {
       await sendWhatsApp(sender, `Bridge error: ${err.message}`).catch(() => {});
       return reply.code(500).send({ error: "route_failed" });
     }
+  }
+
+  // ── Structured debug log (one line per inbound message) ───────────────────
+  if (DEBUG) {
+    app.log.info(
+      {
+        workspace_id: trace.workspace_id,
+        remoteJid: trace.remoteJid,
+        session_id: trace.session_id,
+        objective_id: trace.objective_id,
+        router_decision: trace.router_decision,
+        reason: trace.reason,
+        provider_target: trace.provider,
+        model: trace.model,
+        fallback_used: trace.fallback_used,
+        tools_planned: trace.tools_planned ?? trace.router_decision,
+      },
+      "dbg_inbound",
+    );
   }
 
   return { ok: true };
